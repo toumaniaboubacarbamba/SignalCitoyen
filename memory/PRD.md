@@ -1,170 +1,127 @@
-# SignalCitoyen - Product Requirement Document
+# SignalCitoyen / OSEA - Product Requirement Document
 
-## Vue d'ensemble
+## Architecture Événementielle Implémentée
 
-SignalCitoyen est une application mobile de signalement citoyen pour la gestion de la salubrité, de l'eau et de l'assainissement en Côte d'Ivoire. L'application permet aux citoyens de signaler des problèmes et aux administrateurs du ministère de suivre et traiter ces signalements.
+### 🎯 1. ROUTAGE AUTOMATIQUE (Background Task)
+**Déclencheur** : Création d'un ticket via `POST /api/reports`
 
-## Fonctionnalités MVP
+**Logique** :
+1. Extraction de la zone depuis l'adresse (Cocody, Yopougon, Plateau, etc.)
+2. Mapping type → service technique (water → EAU, drainage → ASSAINISSEMENT, etc.)
+3. Génération de l'ID équipe : `EQUIPE_{SERVICE}_{ZONE}` (ex: `EQUIPE_EAU_COCODY`)
+4. Détection priorité : water/drainage → `urgent_critique`, sinon `normal`
+5. Transition statut : `received` → `assigned`
+6. Notification SMS simulée à l'équipe terrain
 
-### 1. Authentification
-- ✅ Inscription utilisateur (email/mot de passe)
-- ✅ Connexion sécurisée avec JWT
-- ✅ Rôles : Citoyen et Administrateur
-- ✅ Gestion de session persistante
+**Code** : `router_automatiquement()` dans `/app/backend/server.py`
 
-### 2. Signalement (Fonctionnalité principale)
-- ✅ Formulaire de signalement avec :
-  - Type de problème (déchets, eau, assainissement, propreté de rue, autre)
-  - Description détaillée
-  - Localisation GPS automatique
-  - Adresse reverse-geocodée
-  - Photos multiples (caméra ou galerie)
-- ✅ Stockage des photos en base64
-- ✅ Validation des champs obligatoires
+### 🔔 2. SYSTÈME DE NOTIFICATIONS SYNC
+**Déclencheur** : Changement de statut via `PUT /api/reports/{id}`
 
-### 3. Géolocalisation
-- ✅ Capture automatique de la position GPS
-- ✅ Affichage des coordonnées et de l'adresse
-- ✅ Demande de permissions utilisateur
-- ✅ Gestion des erreurs de localisation
+**Logique** :
+- `→ assigned` : SMS simulé à l'équipe terrain (log + audit)
+- `→ resolved` : Email simulé au citoyen avec récapitulatif complet
+- `→ tout` : Push notification au citoyen via Emergent Push Service
 
-### 4. Suivi du signalement
-- ✅ 3 statuts : Reçu → En traitement → Résolu
-- ✅ Mise à jour en temps réel du statut
-- ✅ Historique des signalements
-- ✅ Filtrage par rôle (citoyen voit ses signalements, admin voit tout)
+**Audit log** : Tous les événements sont persistés dans `notification_events` MongoDB
 
-### 5. Historique citoyen
-- ✅ Liste de tous les signalements de l'utilisateur
-- ✅ Badges de statut colorés
-- ✅ Aperçu des photos
-- ✅ Pull-to-refresh
+**Endpoint admin** : `GET /api/admin/notification-events` pour visualiser l'historique
 
-### 6. Tableau de bord admin
-- ✅ Statistiques en temps réel :
-  - Total des signalements
-  - Signalements reçus
-  - Signalements en traitement
-  - Signalements résolus
-- ✅ Vue de tous les signalements
-- ✅ Capacité de mise à jour du statut
-- ✅ Accès restreint aux administrateurs
+### ⏰ 3. ESCALADE AUTOMATIQUE (APScheduler)
+**Déclencheur** : Cron job toutes les 15 minutes (AsyncIOScheduler)
 
-## Architecture technique
+**Logique** :
+1. Scan des tickets `type in [water, drainage]`
+2. Filtre `status in [received, assigned]`
+3. Âge > 4 heures
+4. Pas encore escaladé (`escalated != true`)
+5. Mise à jour atomique : `priority = urgent_critique`, `escalated = true`
+6. Alerte au Superviseur Général (log d'erreur + persistance)
 
-### Backend (FastAPI + MongoDB)
-- **Serveur**: FastAPI avec Uvicorn
-- **Base de données**: MongoDB
-- **Authentification**: JWT avec bcrypt
-- **API**: RESTful avec préfixe /api
-- **Stockage images**: Base64 en MongoDB
+**Code** : `task_escalade_tickets_critiques()` lancée automatiquement au startup
 
-### Frontend (Expo + React Native)
-- **Framework**: Expo SDK 54
-- **Navigation**: Expo Router (file-based routing)
-- **State Management**: React Context API
-- **UI**: React Native components natifs
-- **Permissions**: Camera, Location, Media Library
+## Architecture Backend
 
-### Endpoints API
+```
+FastAPI + MongoDB + APScheduler
+├── BackgroundTasks (pattern event-driven)
+├── AsyncIOScheduler (cron jobs)
+├── httpx AsyncClient (push notifications)
+└── motor (async MongoDB)
+```
 
-#### Authentification
+## Endpoints API
+
+### Auth
 - `POST /api/auth/register` - Inscription
 - `POST /api/auth/login` - Connexion
-- `GET /api/auth/me` - Profil utilisateur
+- `GET /api/auth/me` - Profil
 
-#### Signalements
-- `POST /api/reports` - Créer un signalement
-- `GET /api/reports` - Lister les signalements
-- `GET /api/reports/{id}` - Détails d'un signalement
-- `PUT /api/reports/{id}` - Mettre à jour un signalement (admin)
-- `GET /api/reports/stats/summary` - Statistiques (admin)
+### Signalements
+- `POST /api/reports` - Créer + routage auto en background
+- `GET /api/reports` - Liste (avec filtres status/type/priority)
+- `GET /api/reports/{id}` - Détails
+- `PUT /api/reports/{id}` - Maj statut + notifications
 
-## Modèles de données
+### Admin
+- `GET /api/reports/stats/summary` - Stats complètes
+- `GET /api/admin/notification-events` - Audit log
 
-### User
-```
-{
-  _id: ObjectId,
-  email: string,
-  password: string (hashed),
-  name: string,
-  role: "citizen" | "admin",
-  created_at: datetime
-}
-```
+### Push
+- `POST /api/register-push` - Enregistrement device
 
-### Report
-```
-{
-  _id: ObjectId,
-  user_id: string,
-  user_name: string,
-  type: "waste" | "water" | "drainage" | "street" | "other",
-  description: string,
-  location: {
-    latitude: float,
-    longitude: float,
-    address: string (optional)
-  },
-  photos: [base64_string],
-  status: "received" | "processing" | "resolved",
-  admin_notes: string (optional),
-  created_at: datetime,
-  updated_at: datetime
-}
-```
+## Statuts du Cycle de Vie
 
-## Permissions requises
+| Statut | Label FR | Trigger |
+|--------|----------|---------|
+| `received` | En attente | Création |
+| `assigned` | Assigné | Auto-routage |
+| `processing` | En cours | Manuel admin |
+| `resolved` | Résolu | Manuel admin → Email citoyen |
 
-### iOS (infoPlist)
-- NSCameraUsageDescription: "Prendre des photos des problèmes à signaler"
-- NSPhotoLibraryUsageDescription: "Sélectionner des photos depuis votre galerie"
-- NSLocationWhenInUseUsageDescription: "Localiser le problème signalé"
+## Priorités
 
-### Android
-- CAMERA
-- READ_MEDIA_IMAGES
-- WRITE_EXTERNAL_STORAGE
-- ACCESS_FINE_LOCATION
-- ACCESS_COARSE_LOCATION
+| Priorité | Label | Source |
+|----------|-------|--------|
+| `normal` | Normale | Par défaut |
+| `urgent_critique` | URGENT CRITIQUE | Auto (water/drainage) ou Escalade |
 
-## Écrans de l'application
+## Frontend - Écrans
 
-1. **Connexion/Inscription** - Authentification
-2. **Accueil** - Dashboard avec actions rapides (+ stats admin)
-3. **Nouveau signalement** - Formulaire complet de signalement
-4. **Historique** - Liste des signalements
-5. **Détail signalement** - Vue complète avec possibilité de mise à jour (admin)
-6. **Profil** - Informations utilisateur et déconnexion
+1. **Connexion/Inscription** - Auth
+2. **Accueil** - Dashboard avec stats (admin) + actions rapides
+3. **Nouveau signalement** - Formulaire complet GPS + photos
+4. **Carte** - Leaflet OpenStreetMap avec pins colorés par statut
+5. **Historique** - Liste filtrée par statut/type
+6. **🆕 Admin** - Tableau de bord avec :
+   - Stats détaillées (7 KPI dont urgents/escaladés)
+   - Filtres avancés (statut + urgent uniquement)
+   - **Vraie table responsive** (ID, Date, Type, Lieu, Statut, Actions) sur écran large
+   - Cartes compactes sur mobile
+   - Bouton "Détails" pour ouvrir le ticket complet
+   - Visualisation des escalades (badge URGENT rouge)
+7. **Détail signalement** - Vue complète + maj statut admin
+8. **Profil** - Info user + déconnexion
 
-## Comptes de test
+## Tests Backend
+- **22/22 tests passent (100%)**
+- Couverture : Auth, Reports CRUD, Auto-routage, Notifications, Scheduler, RBAC
+- Suite : `/app/backend/tests/test_event_driven.py`
 
-### Compte Citoyen
-- Email: citoyen@test.com
-- Password: password123
+## Comptes de Test
+- Citoyen : `citoyen@test.com` / `password123`
+- Admin : `admin@test.com` / `admin123`
 
-### Compte Administrateur
-- Email: admin@test.com
-- Password: admin123
+## Mocks en Développement
+- **EMERGENT_PUSH_KEY=placeholder** → Push réelles désactivées (activées au déploiement)
+- **SMS/Email** → Logs + persistance audit (intégration Twilio/SendGrid à brancher en prod)
+- **Superviseur Général** → Log d'erreur structuré (à brancher Slack/Email réel en prod)
 
-## Améliorations futures possibles
-
-- Notifications push pour les mises à jour de statut
-- Carte interactive avec MapView pour visualiser tous les signalements
-- Filtres avancés (par type, par statut, par date)
-- Export des données en CSV pour les admins
-- Système de commentaires entre citoyens et admins
-- Notes de l'administrateur visibles par le citoyen
-- Statistiques détaillées par région
-- Upload de vidéos en plus des photos
-- Mode hors ligne avec synchronisation
-- Multi-langue (Français, Anglais, langues locales)
-
-## Notes de développement
-
-- Les images sont stockées en base64 pour simplifier le MVP
-- L'authentification utilise des tokens JWT avec expiration de 7 jours
-- Les permissions sont vérifiées côté backend via décorateurs
-- L'interface suit les guidelines Material Design et iOS Human Interface
-- L'application est responsive et fonctionne sur iOS et Android
+## Améliorations Futures Possibles
+- Carte de chaleur des incidents par quartier
+- Assignation manuelle d'équipe par l'admin
+- Réassignation entre équipes
+- SLA dynamique par type d'incident
+- Export CSV des tickets/audit log
+- Intégration Twilio (SMS réels) + SendGrid (emails réels)
+- Webhook Slack pour alertes superviseur
