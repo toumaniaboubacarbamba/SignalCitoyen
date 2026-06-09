@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useMemo } from 'react';
 import {
   View,
   Text,
@@ -8,6 +8,7 @@ import {
   RefreshControl,
   ActivityIndicator,
   Image,
+  ScrollView,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -46,12 +47,30 @@ const TYPE_LABELS: Record<string, string> = {
   other: 'Autre',
 };
 
+const STATUS_FILTERS = [
+  { id: 'all', label: 'Tous', icon: 'apps' },
+  { id: 'received', label: 'Reçus', icon: 'mail' },
+  { id: 'processing', label: 'En cours', icon: 'hourglass' },
+  { id: 'resolved', label: 'Résolus', icon: 'checkmark-circle' },
+];
+
+const TYPE_FILTERS = [
+  { id: 'all', label: 'Tous types', icon: 'list' },
+  { id: 'waste', label: 'Déchets', icon: 'trash' },
+  { id: 'water', label: 'Eau', icon: 'water' },
+  { id: 'drainage', label: 'Assainissement', icon: 'funnel' },
+  { id: 'street', label: 'Rue', icon: 'car' },
+  { id: 'other', label: 'Autre', icon: 'ellipsis-horizontal' },
+];
+
 export default function History() {
   const router = useRouter();
   const { isAdmin } = useAuth();
   const [reports, setReports] = useState<Report[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [typeFilter, setTypeFilter] = useState('all');
 
   useEffect(() => {
     loadReports();
@@ -74,6 +93,14 @@ export default function History() {
     loadReports();
   };
 
+  const filteredReports = useMemo(() => {
+    return reports.filter((report) => {
+      if (statusFilter !== 'all' && report.status !== statusFilter) return false;
+      if (typeFilter !== 'all' && report.type !== typeFilter) return false;
+      return true;
+    });
+  }, [reports, statusFilter, typeFilter]);
+
   const formatDate = (dateString: string) => {
     const date = new Date(dateString);
     return date.toLocaleDateString('fr-FR', {
@@ -85,9 +112,10 @@ export default function History() {
 
   const renderReport = ({ item }: { item: Report }) => {
     const statusConfig = STATUS_CONFIG[item.status] || STATUS_CONFIG.received;
-    
+
     return (
       <TouchableOpacity
+        testID={`report-card-${item.id}`}
         style={styles.reportCard}
         onPress={() => router.push(`/report-detail/${item.id}`)}
       >
@@ -145,13 +173,88 @@ export default function History() {
   }
 
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={styles.container} edges={['top']}>
       <View style={styles.header}>
         <Text style={styles.title}>{isAdmin ? 'Tous les signalements' : 'Mes signalements'}</Text>
+        <Text style={styles.subtitle}>
+          {filteredReports.length} signalement{filteredReports.length > 1 ? 's' : ''}
+        </Text>
+      </View>
+
+      {/* Status Filter Chips */}
+      <View style={styles.filterSection}>
+        <Text style={styles.filterLabel}>Statut</Text>
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.chipRow}
+        >
+          {STATUS_FILTERS.map((filter) => (
+            <TouchableOpacity
+              key={filter.id}
+              testID={`filter-status-${filter.id}`}
+              style={[
+                styles.chip,
+                statusFilter === filter.id && styles.chipSelected,
+              ]}
+              onPress={() => setStatusFilter(filter.id)}
+            >
+              <Ionicons
+                name={filter.icon as any}
+                size={14}
+                color={statusFilter === filter.id ? '#ffffff' : '#64748b'}
+              />
+              <Text
+                style={[
+                  styles.chipText,
+                  statusFilter === filter.id && styles.chipTextSelected,
+                ]}
+              >
+                {filter.label}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
+      </View>
+
+      {/* Type Filter Chips */}
+      <View style={styles.filterSection}>
+        <Text style={styles.filterLabel}>Type</Text>
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.chipRow}
+        >
+          {TYPE_FILTERS.map((filter) => (
+            <TouchableOpacity
+              key={filter.id}
+              testID={`filter-type-${filter.id}`}
+              style={[
+                styles.chip,
+                typeFilter === filter.id && styles.chipSelected,
+              ]}
+              onPress={() => setTypeFilter(filter.id)}
+            >
+              <Ionicons
+                name={filter.icon as any}
+                size={14}
+                color={typeFilter === filter.id ? '#ffffff' : '#64748b'}
+              />
+              <Text
+                style={[
+                  styles.chipText,
+                  typeFilter === filter.id && styles.chipTextSelected,
+                ]}
+              >
+                {filter.label}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
       </View>
 
       <FlatList
-        data={reports}
+        data={filteredReports}
         renderItem={renderReport}
         keyExtractor={(item) => item.id}
         contentContainerStyle={styles.listContent}
@@ -163,7 +266,9 @@ export default function History() {
             <Ionicons name="document-text-outline" size={64} color="#cbd5e1" />
             <Text style={styles.emptyText}>Aucun signalement</Text>
             <Text style={styles.emptySubtext}>
-              Commencez par créer votre premier signalement
+              {statusFilter !== 'all' || typeFilter !== 'all'
+                ? 'Essayez d\'autres filtres'
+                : 'Commencez par créer votre premier signalement'}
             </Text>
           </View>
         }
@@ -184,17 +289,65 @@ const styles = StyleSheet.create({
   },
   header: {
     padding: 24,
+    paddingBottom: 16,
     backgroundColor: '#ffffff',
-    borderBottomWidth: 1,
-    borderBottomColor: '#e2e8f0',
   },
   title: {
     fontSize: 24,
     fontWeight: 'bold',
     color: '#1e293b',
   },
+  subtitle: {
+    fontSize: 14,
+    color: '#64748b',
+    marginTop: 4,
+  },
+  filterSection: {
+    backgroundColor: '#ffffff',
+    paddingBottom: 12,
+  },
+  filterLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#64748b',
+    paddingHorizontal: 24,
+    marginBottom: 8,
+    textTransform: 'uppercase',
+  },
+  chipRow: {
+    paddingHorizontal: 24,
+    gap: 8,
+    flexDirection: 'row',
+  },
+  chip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 18,
+    backgroundColor: '#f1f5f9',
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    flexShrink: 0,
+    height: 36,
+  },
+  chipSelected: {
+    backgroundColor: '#2563eb',
+    borderColor: '#2563eb',
+  },
+  chipText: {
+    fontSize: 13,
+    color: '#64748b',
+    marginLeft: 6,
+    fontWeight: '500',
+  },
+  chipTextSelected: {
+    color: '#ffffff',
+    fontWeight: '600',
+  },
   listContent: {
     padding: 16,
+    paddingTop: 8,
   },
   reportCard: {
     backgroundColor: '#ffffff',
@@ -299,5 +452,7 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#94a3b8',
     marginTop: 8,
+    textAlign: 'center',
+    paddingHorizontal: 32,
   },
 });

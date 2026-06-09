@@ -10,6 +10,7 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 import os
 import logging
+import httpx
 from pathlib import Path
 from bson import ObjectId
 
@@ -25,6 +26,16 @@ db = client[os.environ['DB_NAME']]
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production-12345678")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 10080  # 7 days
+
+# Push notifications
+PUSH_BASE_URL = "https://integrations.emergentagent.com"
+PUSH_KEY = os.environ.get("EMERGENT_PUSH_KEY", "placeholder")
+
+_push_client = httpx.AsyncClient(
+    base_url=PUSH_BASE_URL,
+    headers={"X-Push-Key": PUSH_KEY},
+    timeout=10.0,
+)
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
@@ -93,6 +104,31 @@ class ReportCreate(BaseModel):
 class ReportUpdate(BaseModel):
     status: Optional[str] = None
     admin_notes: Optional[str] = None
+
+class RegisterPushBody(BaseModel):
+    user_id: str
+    platform: str
+    device_token: str
+
+# ==================== PUSH NOTIFICATIONS ====================
+
+async def send_push(recipients: List[str], data: dict, idempotency_key: Optional[str] = None) -> None:
+    """Send push notification via Emergent push service."""
+    if not recipients:
+        return
+    if len(recipients) > 100:
+        raise ValueError("max 100 recipients per /trigger call")
+    if "title" not in data or "message" not in data:
+        raise ValueError("data must include title and message")
+    payload = {"recipients": recipients, "data": data}
+    if idempotency_key:
+        payload["$idempotency_key"] = idempotency_key
+    resp = await _push_client.post("/api/v1/push/trigger", json=payload)
+    if resp.status_code == 401:
+        raise HTTPException(500, "EMERGENT_PUSH_KEY missing or invalid")
+    if resp.status_code >= 500:
+        raise HTTPException(502, "Push provider unavailable")
+    resp.raise_for_status()
 
 # ==================== HELPER FUNCTIONS ====================
 
@@ -191,6 +227,25 @@ async def login(user_data: UserLogin):
 @api_router.get("/auth/me", response_model=User)
 async def get_me(current_user: User = Depends(get_current_user)):
     return current_user
+
+# ==================== PUSH REGISTRATION ====================
+
+@api_router.post("/register-push", status_code=201)
+async def register_push(body: RegisterPushBody):
+    try:
+        resp = await _push_client.post("/api/v1/push/users/register", json=body.model_dump())
+        if resp.status_code == 401:
+            raise HTTPException(500, "EMERGENT_PUSH_KEY missing or invalid")
+        if resp.status_code >= 500:
+            raise HTTPException(502, "Push provider unavailable")
+        resp.raise_for_status()
+        return {"status": "registered"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Push registration failed: {e}")
+        return {"status": "failed", "reason": str(e)}
 
 # ==================== REPORT ENDPOINTS ====================
 
@@ -304,6 +359,27 @@ async def update_report(
         {"_id": ObjectId(report_id)},
         {"$set": update_fields}
     )
+    
+    # Send push notification to user if status changed
+    if update_data.status and update_data.status != report["status"]:
+        try:
+            status_messages = {
+                "received": "Votre signalement a été reçu",
+                "processing": "Votre signalement est en cours de traitement",
+                "resolved": "Votre signalement a été résolu",
+            }
+            message = status_messages.get(update_data.status, "Statut du signalement mis à jour")
+            await send_push(
+                recipients=[report["user_id"]],
+                data={
+                    "title": "SignalCitoyen",
+                    "message": message,
+                    "action_url": f"/report-detail/{report_id}",
+                },
+            )
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Push notification failed (non-blocking): {e}")
     
     # Get updated report
     updated_report = await db.reports.find_one({"_id": ObjectId(report_id)})

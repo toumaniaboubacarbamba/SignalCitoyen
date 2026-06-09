@@ -22,6 +22,7 @@
         "backgroundColor": "#000"
       },
       "edgeToEdgeEnabled": true,
+      "googleServicesFile": "./google-services.json",
       "permissions": [
         "CAMERA",
         "READ_MEDIA_IMAGES",
@@ -46,7 +47,8 @@
           "backgroundColor": "#000"
         }
       ],
-      "expo-font"
+      "expo-font",
+      "expo-notifications"
     ],
     "experiments": {
       "typedRoutes": true
