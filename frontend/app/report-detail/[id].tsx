@@ -9,6 +9,9 @@ import {
   Image,
   Alert,
   Dimensions,
+  TextInput,
+  KeyboardAvoidingView,
+  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -25,6 +28,10 @@ interface Report {
   type: string;
   description: string;
   status: string;
+  priority: string;
+  team_id?: string;
+  zone?: string;
+  escalated?: boolean;
   photos: string[];
   admin_notes?: string;
   created_at: string;
@@ -37,8 +44,9 @@ interface Report {
 }
 
 const STATUS_CONFIG: Record<string, { label: string; color: string; bgColor: string; icon: string }> = {
-  received: { label: 'Reçu', color: '#f59e0b', bgColor: '#fef3c7', icon: 'mail' },
-  processing: { label: 'En traitement', color: '#6366f1', bgColor: '#e0e7ff', icon: 'hourglass' },
+  received: { label: 'En attente', color: '#f59e0b', bgColor: '#fef3c7', icon: 'mail' },
+  assigned: { label: 'Assigné', color: '#6366f1', bgColor: '#e0e7ff', icon: 'people' },
+  processing: { label: 'En cours', color: '#0ea5e9', bgColor: '#e0f2fe', icon: 'hourglass' },
   resolved: { label: 'Résolu', color: '#10b981', bgColor: '#d1fae5', icon: 'checkmark-circle' },
 };
 
@@ -58,6 +66,11 @@ export default function ReportDetail() {
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState(false);
 
+  // Edition des notes admin
+  const [editingNotes, setEditingNotes] = useState(false);
+  const [notesValue, setNotesValue] = useState('');
+  const [savingNotes, setSavingNotes] = useState(false);
+
   useEffect(() => {
     loadReport();
   }, [id]);
@@ -66,6 +79,7 @@ export default function ReportDetail() {
     try {
       const response = await axios.get(`${BACKEND_URL}/api/reports/${id}`);
       setReport(response.data);
+      setNotesValue(response.data.admin_notes || '');
     } catch (error) {
       Alert.alert('Erreur', 'Impossible de charger le signalement');
       router.back();
@@ -79,11 +93,10 @@ export default function ReportDetail() {
 
     setUpdating(true);
     try {
-      await axios.put(`${BACKEND_URL}/api/reports/${id}`, {
+      const response = await axios.put(`${BACKEND_URL}/api/reports/${id}`, {
         status: newStatus,
       });
-
-      setReport({ ...report, status: newStatus, updated_at: new Date().toISOString() });
+      setReport(response.data);
       Alert.alert('Succès', 'Statut mis à jour');
     } catch (error) {
       Alert.alert('Erreur', 'Impossible de mettre à jour le statut');
@@ -92,17 +105,41 @@ export default function ReportDetail() {
     }
   };
 
+  const saveNotes = async () => {
+    if (!report) return;
+
+    setSavingNotes(true);
+    try {
+      const response = await axios.put(`${BACKEND_URL}/api/reports/${id}`, {
+        admin_notes: notesValue.trim(),
+      });
+      setReport(response.data);
+      setEditingNotes(false);
+      Alert.alert('Succès', 'Notes enregistrées');
+    } catch (error) {
+      Alert.alert('Erreur', 'Impossible d\'enregistrer les notes');
+    } finally {
+      setSavingNotes(false);
+    }
+  };
+
   const handleStatusUpdate = () => {
     if (!report) return;
 
-    const statusOptions = [
+    const statusOptions: any[] = [
       { text: 'Annuler', style: 'cancel' },
-      { text: 'Reçu', onPress: () => updateStatus('received') },
-      { text: 'En traitement', onPress: () => updateStatus('processing') },
+      { text: 'En attente', onPress: () => updateStatus('received') },
+      { text: 'Assigné', onPress: () => updateStatus('assigned') },
+      { text: 'En cours', onPress: () => updateStatus('processing') },
       { text: 'Résolu', onPress: () => updateStatus('resolved') },
     ];
 
     Alert.alert('Changer le statut', 'Sélectionnez le nouveau statut', statusOptions);
+  };
+
+  const cancelEditNotes = () => {
+    setNotesValue(report?.admin_notes || '');
+    setEditingNotes(false);
   };
 
   const formatDate = (dateString: string) => {
@@ -131,127 +168,244 @@ export default function ReportDetail() {
   }
 
   const statusConfig = STATUS_CONFIG[report.status] || STATUS_CONFIG.received;
+  const isUrgent = report.priority === 'urgent_critique';
 
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
+        <TouchableOpacity testID="back-button" onPress={() => router.back()} style={styles.backButton}>
           <Ionicons name="arrow-back" size={24} color="#1e293b" />
         </TouchableOpacity>
         <Text style={styles.headerTitle}>Détails du signalement</Text>
         <View style={{ width: 40 }} />
       </View>
 
-      <ScrollView style={styles.scrollView}>
-        <View style={styles.statusSection}>
-          <View style={[styles.statusCard, { backgroundColor: statusConfig.bgColor }]}>
-            <Ionicons name={statusConfig.icon as any} size={40} color={statusConfig.color} />
-            <View style={styles.statusInfo}>
-              <Text style={styles.statusLabel}>Statut actuel</Text>
-              <Text style={[styles.statusValue, { color: statusConfig.color }]}>
-                {statusConfig.label}
+      <KeyboardAvoidingView
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        style={{ flex: 1 }}
+      >
+        <ScrollView style={styles.scrollView} keyboardShouldPersistTaps="handled">
+          {/* Urgent banner */}
+          {isUrgent && (
+            <View style={styles.urgentBanner}>
+              <Ionicons name="warning" size={20} color="#ffffff" />
+              <Text style={styles.urgentBannerText}>
+                {report.escalated ? 'ESCALADÉ - PRIORITÉ CRITIQUE' : 'PRIORITÉ URGENTE'}
               </Text>
             </View>
-          </View>
-
-          {isAdmin && (
-            <TouchableOpacity
-              style={styles.updateButton}
-              onPress={handleStatusUpdate}
-              disabled={updating}
-            >
-              {updating ? (
-                <ActivityIndicator color="#2563eb" />
-              ) : (
-                <>
-                  <Ionicons name="create-outline" size={20} color="#2563eb" />
-                  <Text style={styles.updateButtonText}>Modifier le statut</Text>
-                </>
-              )}
-            </TouchableOpacity>
           )}
-        </View>
 
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Informations</Text>
-          
-          <View style={styles.infoRow}>
-            <View style={styles.infoLabel}>
-              <Ionicons name="alert-circle-outline" size={20} color="#64748b" />
-              <Text style={styles.infoLabelText}>Type</Text>
+          <View style={styles.statusSection}>
+            <View style={[styles.statusCard, { backgroundColor: statusConfig.bgColor }]}>
+              <Ionicons name={statusConfig.icon as any} size={40} color={statusConfig.color} />
+              <View style={styles.statusInfo}>
+                <Text style={styles.statusLabel}>Statut actuel</Text>
+                <Text style={[styles.statusValue, { color: statusConfig.color }]}>
+                  {statusConfig.label}
+                </Text>
+              </View>
             </View>
-            <Text style={styles.infoValue}>{TYPE_LABELS[report.type] || report.type}</Text>
+
+            {isAdmin && (
+              <TouchableOpacity
+                testID="update-status-button"
+                style={styles.updateButton}
+                onPress={handleStatusUpdate}
+                disabled={updating}
+              >
+                {updating ? (
+                  <ActivityIndicator color="#2563eb" />
+                ) : (
+                  <>
+                    <Ionicons name="create-outline" size={20} color="#2563eb" />
+                    <Text style={styles.updateButtonText}>Modifier le statut</Text>
+                  </>
+                )}
+              </TouchableOpacity>
+            )}
           </View>
 
-          {isAdmin && (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>Informations</Text>
+
             <View style={styles.infoRow}>
               <View style={styles.infoLabel}>
-                <Ionicons name="person-outline" size={20} color="#64748b" />
-                <Text style={styles.infoLabelText}>Signalé par</Text>
+                <Ionicons name="alert-circle-outline" size={20} color="#64748b" />
+                <Text style={styles.infoLabelText}>Type</Text>
               </View>
-              <Text style={styles.infoValue}>{report.user_name}</Text>
+              <Text style={styles.infoValue}>{TYPE_LABELS[report.type] || report.type}</Text>
+            </View>
+
+            {isAdmin && (
+              <View style={styles.infoRow}>
+                <View style={styles.infoLabel}>
+                  <Ionicons name="person-outline" size={20} color="#64748b" />
+                  <Text style={styles.infoLabelText}>Signalé par</Text>
+                </View>
+                <Text style={styles.infoValue}>{report.user_name}</Text>
+              </View>
+            )}
+
+            {report.team_id && (
+              <View style={styles.infoRow}>
+                <View style={styles.infoLabel}>
+                  <Ionicons name="people-outline" size={20} color="#64748b" />
+                  <Text style={styles.infoLabelText}>Équipe assignée</Text>
+                </View>
+                <Text style={[styles.infoValue, styles.teamId]} numberOfLines={1}>
+                  {report.team_id}
+                </Text>
+              </View>
+            )}
+
+            {report.zone && (
+              <View style={styles.infoRow}>
+                <View style={styles.infoLabel}>
+                  <Ionicons name="navigate-outline" size={20} color="#64748b" />
+                  <Text style={styles.infoLabelText}>Zone</Text>
+                </View>
+                <Text style={styles.infoValue}>{report.zone}</Text>
+              </View>
+            )}
+
+            <View style={styles.infoRow}>
+              <View style={styles.infoLabel}>
+                <Ionicons name="calendar-outline" size={20} color="#64748b" />
+                <Text style={styles.infoLabelText}>Date de création</Text>
+              </View>
+              <Text style={styles.infoValue}>{formatDate(report.created_at)}</Text>
+            </View>
+
+            <View style={styles.infoRow}>
+              <View style={styles.infoLabel}>
+                <Ionicons name="time-outline" size={20} color="#64748b" />
+                <Text style={styles.infoLabelText}>Dernière mise à jour</Text>
+              </View>
+              <Text style={styles.infoValue}>{formatDate(report.updated_at)}</Text>
+            </View>
+          </View>
+
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>Description</Text>
+            <Text style={styles.description}>{report.description}</Text>
+          </View>
+
+          {report.photos.length > 0 && (
+            <View style={styles.section}>
+              <Text style={styles.sectionTitle}>Photos ({report.photos.length})</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                <View style={styles.photosContainer}>
+                  {report.photos.map((photo, index) => (
+                    <Image key={index} source={{ uri: photo }} style={styles.photo} />
+                  ))}
+                </View>
+              </ScrollView>
             </View>
           )}
 
-          <View style={styles.infoRow}>
-            <View style={styles.infoLabel}>
-              <Ionicons name="calendar-outline" size={20} color="#64748b" />
-              <Text style={styles.infoLabelText}>Date de création</Text>
-            </View>
-            <Text style={styles.infoValue}>{formatDate(report.created_at)}</Text>
-          </View>
-
-          <View style={styles.infoRow}>
-            <View style={styles.infoLabel}>
-              <Ionicons name="time-outline" size={20} color="#64748b" />
-              <Text style={styles.infoLabelText}>Dernière mise à jour</Text>
-            </View>
-            <Text style={styles.infoValue}>{formatDate(report.updated_at)}</Text>
-          </View>
-        </View>
-
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Description</Text>
-          <Text style={styles.description}>{report.description}</Text>
-        </View>
-
-        {report.photos.length > 0 && (
           <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Photos ({report.photos.length})</Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-              <View style={styles.photosContainer}>
-                {report.photos.map((photo, index) => (
-                  <Image key={index} source={{ uri: photo }} style={styles.photo} />
-                ))}
+            <Text style={styles.sectionTitle}>Localisation</Text>
+            <View style={styles.locationCard}>
+              <Ionicons name="location" size={24} color="#2563eb" />
+              <View style={styles.locationInfo}>
+                {report.location.address ? (
+                  <Text style={styles.locationAddress}>{report.location.address}</Text>
+                ) : null}
+                <Text style={styles.locationCoords}>
+                  {report.location.latitude.toFixed(6)}, {report.location.longitude.toFixed(6)}
+                </Text>
               </View>
-            </ScrollView>
-          </View>
-        )}
-
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Localisation</Text>
-          <View style={styles.locationCard}>
-            <Ionicons name="location" size={24} color="#2563eb" />
-            <View style={styles.locationInfo}>
-              {report.location.address ? (
-                <Text style={styles.locationAddress}>{report.location.address}</Text>
-              ) : null}
-              <Text style={styles.locationCoords}>
-                {report.location.latitude.toFixed(6)}, {report.location.longitude.toFixed(6)}
-              </Text>
             </View>
           </View>
-        </View>
 
-        {report.admin_notes && (
-          <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Notes de l'administrateur</Text>
-            <View style={styles.adminNotesCard}>
-              <Text style={styles.adminNotes}>{report.admin_notes}</Text>
+          {/* ====== NOTES ADMIN (CITOYEN: lecture seule | ADMIN: édition) ====== */}
+          {(report.admin_notes || isAdmin) && (
+            <View style={styles.section}>
+              <View style={styles.notesHeader}>
+                <Text style={styles.sectionTitle}>
+                  {isAdmin ? 'Notes administrateur' : 'Notes de l\'administrateur'}
+                </Text>
+                {isAdmin && !editingNotes && (
+                  <TouchableOpacity
+                    testID="edit-notes-button"
+                    style={styles.editIconButton}
+                    onPress={() => setEditingNotes(true)}
+                  >
+                    <Ionicons
+                      name={report.admin_notes ? 'create-outline' : 'add-circle-outline'}
+                      size={22}
+                      color="#2563eb"
+                    />
+                    <Text style={styles.editIconText}>
+                      {report.admin_notes ? 'Modifier' : 'Ajouter'}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+
+              {editingNotes ? (
+                <View>
+                  <TextInput
+                    testID="admin-notes-input"
+                    style={styles.notesInput}
+                    value={notesValue}
+                    onChangeText={setNotesValue}
+                    placeholder="Ajoutez des notes internes sur ce signalement (visibles par tous les admins et le citoyen)..."
+                    placeholderTextColor="#94a3b8"
+                    multiline
+                    numberOfLines={5}
+                    textAlignVertical="top"
+                    maxLength={1000}
+                  />
+                  <Text style={styles.charCount}>{notesValue.length}/1000 caractères</Text>
+                  <View style={styles.notesActions}>
+                    <TouchableOpacity
+                      testID="cancel-notes-button"
+                      style={styles.cancelButton}
+                      onPress={cancelEditNotes}
+                      disabled={savingNotes}
+                    >
+                      <Text style={styles.cancelButtonText}>Annuler</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      testID="save-notes-button"
+                      style={[styles.saveButton, savingNotes && styles.buttonDisabled]}
+                      onPress={saveNotes}
+                      disabled={savingNotes}
+                    >
+                      {savingNotes ? (
+                        <ActivityIndicator color="#ffffff" size="small" />
+                      ) : (
+                        <>
+                          <Ionicons name="checkmark" size={18} color="#ffffff" />
+                          <Text style={styles.saveButtonText}>Enregistrer</Text>
+                        </>
+                      )}
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              ) : report.admin_notes ? (
+                <View style={styles.adminNotesCard}>
+                  <Ionicons name="document-text" size={18} color="#92400e" />
+                  <Text style={styles.adminNotes}>{report.admin_notes}</Text>
+                </View>
+              ) : (
+                <View style={styles.emptyNotesCard}>
+                  <Ionicons name="document-text-outline" size={32} color="#cbd5e1" />
+                  <Text style={styles.emptyNotesText}>
+                    Aucune note pour le moment
+                  </Text>
+                  <Text style={styles.emptyNotesSubtext}>
+                    Cliquez sur "Ajouter" pour créer une note interne
+                  </Text>
+                </View>
+              )}
             </View>
-          </View>
-        )}
-      </ScrollView>
+          )}
+
+          <View style={{ height: 32 }} />
+        </ScrollView>
+      </KeyboardAvoidingView>
     </SafeAreaView>
   );
 }
@@ -287,6 +441,20 @@ const styles = StyleSheet.create({
   },
   scrollView: {
     flex: 1,
+  },
+  urgentBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#dc2626',
+    paddingVertical: 10,
+    gap: 8,
+  },
+  urgentBannerText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
+    letterSpacing: 0.5,
   },
   statusSection: {
     padding: 24,
@@ -359,6 +527,13 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
     color: '#1e293b',
+    flex: 1,
+    textAlign: 'right',
+    marginLeft: 12,
+  },
+  teamId: {
+    color: '#2563eb',
+    fontSize: 12,
   },
   description: {
     fontSize: 16,
@@ -396,16 +571,114 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#64748b',
   },
+  // ====== NOTES ADMIN STYLES ======
+  notesHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  editIconButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: '#dbeafe',
+  },
+  editIconText: {
+    fontSize: 13,
+    color: '#2563eb',
+    fontWeight: '600',
+  },
+  notesInput: {
+    backgroundColor: '#f8fafc',
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    borderRadius: 12,
+    padding: 14,
+    fontSize: 15,
+    color: '#1e293b',
+    minHeight: 120,
+    lineHeight: 22,
+  },
+  charCount: {
+    fontSize: 12,
+    color: '#94a3b8',
+    textAlign: 'right',
+    marginTop: 6,
+  },
+  notesActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 12,
+    marginTop: 12,
+  },
+  cancelButton: {
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 10,
+    backgroundColor: '#f1f5f9',
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  cancelButtonText: {
+    color: '#475569',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  saveButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 10,
+    backgroundColor: '#2563eb',
+  },
+  saveButtonText: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  buttonDisabled: {
+    opacity: 0.6,
+  },
   adminNotesCard: {
+    flexDirection: 'row',
     backgroundColor: '#fef3c7',
     padding: 16,
     borderRadius: 12,
     borderWidth: 1,
     borderColor: '#fde68a',
+    gap: 10,
   },
   adminNotes: {
+    flex: 1,
     fontSize: 14,
     color: '#92400e',
-    lineHeight: 20,
+    lineHeight: 22,
+  },
+  emptyNotesCard: {
+    alignItems: 'center',
+    padding: 24,
+    backgroundColor: '#f8fafc',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: '#cbd5e1',
+  },
+  emptyNotesText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#64748b',
+    marginTop: 8,
+  },
+  emptyNotesSubtext: {
+    fontSize: 12,
+    color: '#94a3b8',
+    marginTop: 4,
+    textAlign: 'center',
   },
 });
