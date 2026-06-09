@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "50436701849",
+    "project_id": "signalcitoyen-4a6e0",
+    "storage_bucket": "signalcitoyen-4a6e0.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:50436701849:android:16fba113fcf55ecec60208",
+        "android_client_info": {
+          "package_name": "com.veone.signalcitoyen"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDDVjoiQWg-nHFPXBtextRqVcfrhoWuKcc"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

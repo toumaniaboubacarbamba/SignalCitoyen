@@ -17,6 +17,7 @@
       }
     },
     "android": {
+      "package": "com.veone.signalcitoyen",
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#000"
