@@ -681,7 +681,13 @@ async def get_reports(
     if priority_filter:
         query["priority"] = priority_filter
 
-    reports = await db.reports.find(query).sort("created_at", -1).to_list(1000)
+    # Optimisation: exclure les photos (base64 volumineux) en vue liste
+    # Les photos sont chargées uniquement dans la vue détail
+    reports = await db.reports.find(query).sort("created_at", -1).limit(200).to_list(200)
+    # Stripper les photos lourdes pour la liste (garde la première en preview)
+    for r in reports:
+        photos = r.get("photos", [])
+        r["photos"] = photos[:1] if photos else []
     return [report_doc_to_model(r) for r in reports]
 
 

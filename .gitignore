@@ -76,6 +76,9 @@ agenthub/agents/youtube/db
 # Build caches
 .cache/
 
+# Test credentials (should not be deployed to production)
+test_credentials.md
+
 # Mobile development
 android-sdk/
 credentials.json
