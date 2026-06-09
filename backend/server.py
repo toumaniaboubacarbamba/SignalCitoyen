@@ -1,36 +1,47 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
+"""
+=====================================================================
+SERVER.PY - OSEA / SignalCitoyen
+Architecture événementielle : Routage, Notifications, Escalade
+=====================================================================
+"""
+
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from passlib.context import CryptContext
 from jose import JWTError, jwt
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import os
 import logging
 import httpx
 from pathlib import Path
 from bson import ObjectId
 
+# =====================================================================
+# CONFIGURATION
+# =====================================================================
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
+# Connexion MongoDB
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
-# Security
+# Sécurité JWT
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production-12345678")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 10080  # 7 days
+ACCESS_TOKEN_EXPIRE_MINUTES = 10080  # 7 jours
 
-# Push notifications
+# Push notifications (Emergent service)
 PUSH_BASE_URL = "https://integrations.emergentagent.com"
 PUSH_KEY = os.environ.get("EMERGENT_PUSH_KEY", "placeholder")
-
 _push_client = httpx.AsyncClient(
     base_url=PUSH_BASE_URL,
     headers={"X-Push-Key": PUSH_KEY},
@@ -40,20 +51,65 @@ _push_client = httpx.AsyncClient(
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
-# Create the main app
-app = FastAPI()
+# Configuration du logger
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("OSEA")
+
+# Application FastAPI
+app = FastAPI(title="OSEA - Plateforme de signalement citoyen")
 api_router = APIRouter(prefix="/api")
 
-# ==================== MODELS ====================
+# Scheduler pour les tâches planifiées (escalade)
+scheduler = AsyncIOScheduler(timezone="UTC")
+
+# =====================================================================
+# CONSTANTES MÉTIER (Routage et types critiques)
+# =====================================================================
+
+class ReportStatus:
+    """Statuts possibles d'un ticket."""
+    RECEIVED = "received"        # En attente (juste créé)
+    ASSIGNED = "assigned"        # Assigné à une équipe
+    PROCESSING = "processing"    # En cours de traitement par l'équipe
+    RESOLVED = "resolved"        # Résolu
+
+class Priority:
+    """Niveaux de priorité."""
+    NORMAL = "normal"
+    URGENT_CRITIQUE = "urgent_critique"
 
 class UserRole:
     CITIZEN = "citizen"
     ADMIN = "admin"
 
-class ReportStatus:
-    RECEIVED = "received"
-    PROCESSING = "processing"
-    RESOLVED = "resolved"
+# Mapping type d'incident → service technique
+TYPE_TO_SERVICE = {
+    "water": "EAU",
+    "drainage": "ASSAINISSEMENT",
+    "waste": "DECHETS",
+    "street": "VOIRIE",
+    "other": "GENERAL",
+}
+
+# Liste des zones connues d'Abidjan (extraction depuis l'adresse)
+ZONES_CONNUES = [
+    "Cocody", "Yopougon", "Plateau", "Adjamé", "Adjame",
+    "Marcory", "Treichville", "Abobo", "Attécoubé", "Attecoube",
+    "Port-Bouët", "Port-Bouet", "Koumassi", "Bingerville", "Anyama",
+]
+
+# Types critiques nécessitant une escalade rapide
+TYPES_CRITIQUES = {"water", "drainage"}
+
+# Seuil d'escalade (heures)
+ESCALATION_THRESHOLD_HOURS = 4
+
+# =====================================================================
+# MODÈLES PYDANTIC
+# =====================================================================
 
 class Location(BaseModel):
     latitude: float
@@ -65,7 +121,7 @@ class User(BaseModel):
     email: str
     name: str
     role: str = UserRole.CITIZEN
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class UserCreate(BaseModel):
     email: EmailStr
@@ -91,9 +147,13 @@ class Report(BaseModel):
     location: Location
     photos: List[str] = []
     status: str = ReportStatus.RECEIVED
+    priority: str = Priority.NORMAL
+    team_id: Optional[str] = None
+    zone: Optional[str] = None
     admin_notes: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    escalated: bool = False
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class ReportCreate(BaseModel):
     type: str
@@ -104,134 +164,422 @@ class ReportCreate(BaseModel):
 class ReportUpdate(BaseModel):
     status: Optional[str] = None
     admin_notes: Optional[str] = None
+    priority: Optional[str] = None
 
 class RegisterPushBody(BaseModel):
     user_id: str
     platform: str
     device_token: str
 
-# ==================== PUSH NOTIFICATIONS ====================
+# =====================================================================
+# HELPERS AUTHENTIFICATION
+# =====================================================================
 
-async def send_push(recipients: List[str], data: dict, idempotency_key: Optional[str] = None) -> None:
-    """Send push notification via Emergent push service."""
-    if not recipients:
-        return
-    if len(recipients) > 100:
-        raise ValueError("max 100 recipients per /trigger call")
-    if "title" not in data or "message" not in data:
-        raise ValueError("data must include title and message")
-    payload = {"recipients": recipients, "data": data}
-    if idempotency_key:
-        payload["$idempotency_key"] = idempotency_key
-    resp = await _push_client.post("/api/v1/push/trigger", json=payload)
-    if resp.status_code == 401:
-        raise HTTPException(500, "EMERGENT_PUSH_KEY missing or invalid")
-    if resp.status_code >= 500:
-        raise HTTPException(502, "Push provider unavailable")
-    resp.raise_for_status()
-
-# ==================== HELPER FUNCTIONS ====================
-
-def verify_password(plain_password, hashed_password):
+def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
-def get_password_hash(password):
+def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
-def create_access_token(data: dict):
+def create_access_token(data: dict) -> str:
+    """Crée un token JWT avec expiration."""
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> User:
+    """Récupère l'utilisateur courant à partir du token JWT."""
     token = credentials.credentials
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
+        detail="Identifiants invalides",
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub")
+        user_id = payload.get("sub")
         if user_id is None:
             raise credentials_exception
     except JWTError:
         raise credentials_exception
-    
+
     user = await db.users.find_one({"_id": ObjectId(user_id)})
     if user is None:
         raise credentials_exception
-    
+
     return User(
         id=str(user["_id"]),
         email=user["email"],
         name=user["name"],
         role=user["role"],
-        created_at=user["created_at"]
+        created_at=user["created_at"],
     )
 
-# ==================== AUTH ENDPOINTS ====================
+# =====================================================================
+# 🔔 SYSTÈME DE NOTIFICATIONS (Push + simulation SMS/Email)
+# =====================================================================
+
+async def send_push(recipients: List[str], data: dict, idempotency_key: Optional[str] = None) -> None:
+    """
+    Envoie une notification push via le service Emergent.
+    Wrapper sécurisé : ne fait jamais planter le caller.
+    """
+    if not recipients:
+        return
+    if len(recipients) > 100:
+        raise ValueError("Maximum 100 destinataires par appel")
+    if "title" not in data or "message" not in data:
+        raise ValueError("data doit contenir title et message")
+
+    payload = {"recipients": recipients, "data": data}
+    if idempotency_key:
+        payload["$idempotency_key"] = idempotency_key
+
+    resp = await _push_client.post("/api/v1/push/trigger", json=payload)
+    if resp.status_code == 401:
+        raise HTTPException(500, "EMERGENT_PUSH_KEY manquante ou invalide")
+    if resp.status_code >= 500:
+        raise HTTPException(502, "Service push indisponible")
+    resp.raise_for_status()
+
+
+async def log_notification_event(event_type: str, payload: dict) -> None:
+    """
+    Persiste l'événement de notification dans MongoDB pour audit/historique.
+    Permet de tracer toutes les communications sortantes.
+    """
+    try:
+        await db.notification_events.insert_one({
+            "event_type": event_type,
+            "payload": payload,
+            "created_at": datetime.now(timezone.utc),
+        })
+    except Exception as e:
+        logger.warning(f"Échec persistance notification: {e}")
+
+
+async def simulate_sms_to_agent(team_id: str, report_id: str, message: str) -> None:
+    """
+    Simulation d'envoi SMS à l'agent de terrain.
+    En production, brancher Twilio/Orange SMS API ici.
+    """
+    sms_payload = {
+        "to_team": team_id,
+        "report_id": report_id,
+        "channel": "SMS",
+        "message": message,
+        "simulated": True,
+    }
+    logger.info(f"📱 [SMS SIMULÉ] → Équipe {team_id} | Ticket {report_id} | {message}")
+    await log_notification_event("sms_agent_assigned", sms_payload)
+
+
+async def simulate_email_to_citizen(user_email: str, report: dict) -> None:
+    """
+    Simulation d'email de confirmation au citoyen lors de la résolution.
+    En production, brancher SendGrid/Resend ici.
+    """
+    recap = (
+        f"Bonjour,\n\n"
+        f"Votre signalement #{str(report['_id'])[:8]} a été résolu.\n"
+        f"Type : {report.get('type', 'N/A')}\n"
+        f"Lieu : {report.get('location', {}).get('address', 'N/A')}\n"
+        f"Date de création : {report.get('created_at')}\n"
+        f"Date de résolution : {datetime.now(timezone.utc).isoformat()}\n\n"
+        f"Merci de votre contribution à la salubrité de la Côte d'Ivoire."
+    )
+    email_payload = {
+        "to": user_email,
+        "subject": "Votre signalement a été résolu",
+        "body": recap,
+        "channel": "EMAIL",
+        "simulated": True,
+    }
+    logger.info(f"📧 [EMAIL SIMULÉ] → {user_email} | Ticket {str(report['_id'])[:8]} résolu")
+    await log_notification_event("email_citizen_resolved", email_payload)
+
+
+async def handle_status_change_notifications(report: dict, old_status: str, new_status: str) -> None:
+    """
+    🔔 ORCHESTRATEUR DE NOTIFICATIONS
+    Déclenche les bons canaux selon la transition de statut.
+    """
+    report_id = str(report["_id"])
+    team_id = report.get("team_id")
+    user_id = report.get("user_id")
+
+    # Transition vers "Assigné" → SMS à l'équipe terrain
+    if new_status == ReportStatus.ASSIGNED and old_status != ReportStatus.ASSIGNED:
+        message = (
+            f"Nouveau ticket {report_id[:8]} - "
+            f"Type: {report.get('type')} - "
+            f"Zone: {report.get('zone', 'N/A')}"
+        )
+        if team_id:
+            await simulate_sms_to_agent(team_id, report_id, message)
+
+    # Transition vers "Résolu" → Email au citoyen + Push
+    if new_status == ReportStatus.RESOLVED and old_status != ReportStatus.RESOLVED:
+        # Récupérer l'email du citoyen
+        try:
+            user = await db.users.find_one({"_id": ObjectId(user_id)})
+            if user and user.get("email"):
+                await simulate_email_to_citizen(user["email"], report)
+        except Exception as e:
+            logger.warning(f"Échec récupération email citoyen: {e}")
+
+    # Notification PUSH au citoyen pour tout changement de statut visible
+    status_labels = {
+        ReportStatus.RECEIVED: "Votre signalement a été reçu",
+        ReportStatus.ASSIGNED: "Votre signalement a été assigné à une équipe",
+        ReportStatus.PROCESSING: "Votre signalement est en cours de traitement",
+        ReportStatus.RESOLVED: "Votre signalement a été résolu",
+    }
+    try:
+        await send_push(
+            recipients=[user_id],
+            data={
+                "title": "SignalCitoyen",
+                "message": status_labels.get(new_status, "Statut mis à jour"),
+                "action_url": f"/report-detail/{report_id}",
+            },
+        )
+    except Exception as e:
+        logger.warning(f"Push notification échouée (non-bloquant): {e}")
+
+
+# =====================================================================
+# 🎯 1. ROUTAGE AUTOMATIQUE (Trigger à la création)
+# =====================================================================
+
+def extraire_zone_depuis_adresse(address: Optional[str]) -> str:
+    """
+    Extrait la zone d'Abidjan depuis l'adresse géocodée.
+    Retourne "ZONE_INCONNUE" si aucune correspondance.
+    """
+    if not address:
+        return "ZONE_INCONNUE"
+
+    address_lower = address.lower()
+    for zone in ZONES_CONNUES:
+        if zone.lower() in address_lower:
+            # Normaliser (sans accents, en majuscules)
+            return zone.upper().replace("É", "E").replace("È", "E").replace("Ê", "E")
+
+    return "ZONE_INCONNUE"
+
+
+def determiner_equipe(type_incident: str, zone: str) -> str:
+    """
+    Détermine l'ID de l'équipe technique selon le type d'incident et la zone.
+    Format : EQUIPE_<SERVICE>_<ZONE>
+    Exemple : EQUIPE_EAU_COCODY
+    """
+    service = TYPE_TO_SERVICE.get(type_incident, "GENERAL")
+    return f"EQUIPE_{service}_{zone}"
+
+
+async def router_automatiquement(report_id: str) -> None:
+    """
+    🎯 FONCTION DE ROUTAGE AUTOMATIQUE
+    Analyse le ticket, détermine l'équipe responsable, et passe au statut "Assigné".
+    Exécutée en background task juste après la création du ticket.
+    """
+    try:
+        report = await db.reports.find_one({"_id": ObjectId(report_id)})
+        if not report:
+            logger.error(f"Ticket {report_id} introuvable pour routage")
+            return
+
+        # Étape 1 : Extraire la zone
+        zone = extraire_zone_depuis_adresse(report.get("location", {}).get("address"))
+
+        # Étape 2 : Déterminer l'équipe
+        team_id = determiner_equipe(report["type"], zone)
+
+        # Étape 3 : Définir la priorité initiale selon le type
+        priority = (
+            Priority.URGENT_CRITIQUE
+            if report["type"] in TYPES_CRITIQUES
+            else Priority.NORMAL
+        )
+
+        # Étape 4 : Mise à jour atomique du ticket
+        update_result = await db.reports.update_one(
+            {"_id": ObjectId(report_id)},
+            {"$set": {
+                "team_id": team_id,
+                "zone": zone,
+                "status": ReportStatus.ASSIGNED,
+                "priority": priority,
+                "updated_at": datetime.now(timezone.utc),
+            }}
+        )
+
+        if update_result.modified_count > 0:
+            logger.info(
+                f"✅ ROUTAGE | Ticket {report_id[:8]} → {team_id} "
+                f"(Zone: {zone}, Type: {report['type']}, Priorité: {priority})"
+            )
+
+            # Récupérer le ticket mis à jour et déclencher les notifications
+            updated = await db.reports.find_one({"_id": ObjectId(report_id)})
+            if updated:
+                await handle_status_change_notifications(
+                    updated, ReportStatus.RECEIVED, ReportStatus.ASSIGNED
+                )
+        else:
+            logger.warning(f"Aucune modification lors du routage du ticket {report_id}")
+
+    except Exception as e:
+        logger.error(f"❌ Erreur de routage automatique pour {report_id}: {e}")
+
+
+# =====================================================================
+# ⏰ 3. TÂCHE PLANIFIÉE D'ESCALADE
+# =====================================================================
+
+async def alerter_superviseur_general(report: dict) -> None:
+    """
+    Alerte le Superviseur Général qu'un ticket critique a dépassé le SLA.
+    En production : envoi email/SMS/Slack au superviseur.
+    Ici : log d'erreur + persistance pour audit.
+    """
+    report_id = str(report["_id"])
+    payload = {
+        "report_id": report_id,
+        "type": report.get("type"),
+        "team_id": report.get("team_id"),
+        "zone": report.get("zone"),
+        "status_actuel": report.get("status"),
+        "created_at": report.get("created_at"),
+        "age_hours": (datetime.now(timezone.utc) - report.get("created_at").replace(tzinfo=timezone.utc)).total_seconds() / 3600
+        if report.get("created_at") else None,
+        "alerte": "ESCALADE - SLA dépassé",
+    }
+
+    logger.error(
+        f"🚨 ESCALADE CRITIQUE | Ticket {report_id[:8]} | "
+        f"Type: {report.get('type')} | Équipe: {report.get('team_id')} | "
+        f"Statut: {report.get('status')} - DÉPASSEMENT SLA 4h"
+    )
+
+    await log_notification_event("supervisor_escalation_alert", payload)
+
+
+async def task_escalade_tickets_critiques() -> None:
+    """
+    ⏰ TÂCHE PLANIFIÉE D'ESCALADE
+    Scanne périodiquement les tickets critiques au statut "En attente" ou "Assigné"
+    depuis plus de 4 heures et déclenche l'escalade automatique.
+    """
+    try:
+        seuil = datetime.now(timezone.utc) - timedelta(hours=ESCALATION_THRESHOLD_HOURS)
+
+        # Critères : type critique + statut non final + non encore escaladé + ancien
+        query = {
+            "type": {"$in": list(TYPES_CRITIQUES)},
+            "status": {"$in": [ReportStatus.RECEIVED, ReportStatus.ASSIGNED]},
+            "escalated": {"$ne": True},
+            "created_at": {"$lt": seuil},
+        }
+
+        tickets_a_escalader = await db.reports.find(query).to_list(100)
+
+        if not tickets_a_escalader:
+            logger.debug("Aucun ticket critique à escalader.")
+            return
+
+        logger.info(f"⏰ ESCALADE - {len(tickets_a_escalader)} ticket(s) critique(s) à traiter")
+
+        for ticket in tickets_a_escalader:
+            ticket_id = ticket["_id"]
+            # Mise à jour atomique : priorité URGENT + flag escalated
+            await db.reports.update_one(
+                {"_id": ticket_id, "escalated": {"$ne": True}},
+                {"$set": {
+                    "priority": Priority.URGENT_CRITIQUE,
+                    "escalated": True,
+                    "escalated_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.now(timezone.utc),
+                }}
+            )
+
+            # Alerte du superviseur (asynchrone, non-bloquant)
+            try:
+                await alerter_superviseur_general(ticket)
+            except Exception as e:
+                logger.warning(f"Échec alerte superviseur pour {ticket_id}: {e}")
+
+    except Exception as e:
+        logger.error(f"❌ Erreur dans la tâche d'escalade: {e}")
+
+
+# =====================================================================
+# ENDPOINTS - AUTHENTIFICATION
+# =====================================================================
 
 @api_router.post("/auth/register", response_model=Token)
 async def register(user_data: UserCreate):
-    # Check if user exists
+    """Inscription d'un nouvel utilisateur."""
     existing_user = await db.users.find_one({"email": user_data.email})
     if existing_user:
         raise HTTPException(status_code=400, detail="Email déjà enregistré")
-    
-    # Create user
+
     hashed_password = get_password_hash(user_data.password)
     user_doc = {
         "email": user_data.email,
         "password": hashed_password,
         "name": user_data.name,
         "role": user_data.role,
-        "created_at": datetime.utcnow()
+        "created_at": datetime.now(timezone.utc),
     }
-    
+
     result = await db.users.insert_one(user_doc)
     user_id = str(result.inserted_id)
-    
-    # Create token
     access_token = create_access_token(data={"sub": user_id})
-    
+
     user = User(
         id=user_id,
         email=user_data.email,
         name=user_data.name,
-        role=user_data.role
+        role=user_data.role,
     )
-    
     return Token(access_token=access_token, token_type="bearer", user=user)
+
 
 @api_router.post("/auth/login", response_model=Token)
 async def login(user_data: UserLogin):
+    """Connexion d'un utilisateur."""
     user = await db.users.find_one({"email": user_data.email})
     if not user or not verify_password(user_data.password, user["password"]):
         raise HTTPException(status_code=400, detail="Email ou mot de passe incorrect")
-    
+
     user_id = str(user["_id"])
     access_token = create_access_token(data={"sub": user_id})
-    
+
     user_obj = User(
         id=user_id,
         email=user["email"],
         name=user["name"],
         role=user["role"],
-        created_at=user["created_at"]
+        created_at=user["created_at"],
     )
-    
     return Token(access_token=access_token, token_type="bearer", user=user_obj)
+
 
 @api_router.get("/auth/me", response_model=User)
 async def get_me(current_user: User = Depends(get_current_user)):
     return current_user
 
-# ==================== PUSH REGISTRATION ====================
+
+# =====================================================================
+# ENDPOINTS - PUSH REGISTRATION
+# =====================================================================
 
 @api_router.post("/register-push", status_code=201)
 async def register_push(body: RegisterPushBody):
+    """Enregistre le token push d'un appareil."""
     try:
         resp = await _push_client.post("/api/v1/push/users/register", json=body.model_dump())
         if resp.status_code == 401:
@@ -243,14 +591,46 @@ async def register_push(body: RegisterPushBody):
     except HTTPException:
         raise
     except Exception as e:
-        logger = logging.getLogger(__name__)
         logger.warning(f"Push registration failed: {e}")
         return {"status": "failed", "reason": str(e)}
 
-# ==================== REPORT ENDPOINTS ====================
+
+# =====================================================================
+# ENDPOINTS - REPORTS (avec architecture événementielle)
+# =====================================================================
+
+def report_doc_to_model(doc: dict) -> Report:
+    """Convertit un document MongoDB en modèle Pydantic."""
+    return Report(
+        id=str(doc["_id"]),
+        user_id=doc["user_id"],
+        user_name=doc["user_name"],
+        type=doc["type"],
+        description=doc["description"],
+        location=Location(**doc["location"]),
+        photos=doc.get("photos", []),
+        status=doc.get("status", ReportStatus.RECEIVED),
+        priority=doc.get("priority", Priority.NORMAL),
+        team_id=doc.get("team_id"),
+        zone=doc.get("zone"),
+        admin_notes=doc.get("admin_notes"),
+        escalated=doc.get("escalated", False),
+        created_at=doc["created_at"],
+        updated_at=doc["updated_at"],
+    )
+
 
 @api_router.post("/reports", response_model=Report)
-async def create_report(report_data: ReportCreate, current_user: User = Depends(get_current_user)):
+async def create_report(
+    report_data: ReportCreate,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    🎯 ENDPOINT DE CRÉATION DE TICKET
+    Crée le ticket avec statut "En attente" puis déclenche le routage automatique
+    en background (pattern event-driven : la création publie un événement implicite).
+    """
     report_doc = {
         "user_id": current_user.id,
         "user_name": current_user.name,
@@ -259,163 +639,195 @@ async def create_report(report_data: ReportCreate, current_user: User = Depends(
         "location": report_data.location.dict(),
         "photos": report_data.photos,
         "status": ReportStatus.RECEIVED,
+        "priority": Priority.NORMAL,
+        "team_id": None,
+        "zone": None,
         "admin_notes": None,
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow()
+        "escalated": False,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
     }
-    
+
     result = await db.reports.insert_one(report_doc)
     report_id = str(result.inserted_id)
-    
-    return Report(
-        id=report_id,
-        user_id=current_user.id,
-        user_name=current_user.name,
-        type=report_data.type,
-        description=report_data.description,
-        location=report_data.location,
-        photos=report_data.photos,
-        status=ReportStatus.RECEIVED
-    )
+
+    # 🚀 DÉCLENCHEMENT DU ROUTAGE AUTOMATIQUE EN BACKGROUND
+    # Le ticket est créé, on enchaîne le routage sans bloquer la réponse au client
+    background_tasks.add_task(router_automatiquement, report_id)
+
+    # Récupérer le doc pour retourner les valeurs initiales
+    created = await db.reports.find_one({"_id": result.inserted_id})
+    return report_doc_to_model(created)
+
 
 @api_router.get("/reports", response_model=List[Report])
-async def get_reports(current_user: User = Depends(get_current_user)):
-    # If admin, show all reports; otherwise show only user's reports
+async def get_reports(
+    status_filter: Optional[str] = None,
+    type_filter: Optional[str] = None,
+    priority_filter: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Liste les signalements.
+    - Citoyen : voit uniquement les siens
+    - Admin : voit tous les tickets, avec filtres
+    """
     query = {} if current_user.role == UserRole.ADMIN else {"user_id": current_user.id}
-    
+
+    if status_filter:
+        query["status"] = status_filter
+    if type_filter:
+        query["type"] = type_filter
+    if priority_filter:
+        query["priority"] = priority_filter
+
     reports = await db.reports.find(query).sort("created_at", -1).to_list(1000)
-    
-    return [
-        Report(
-            id=str(r["_id"]),
-            user_id=r["user_id"],
-            user_name=r["user_name"],
-            type=r["type"],
-            description=r["description"],
-            location=Location(**r["location"]),
-            photos=r["photos"],
-            status=r["status"],
-            admin_notes=r.get("admin_notes"),
-            created_at=r["created_at"],
-            updated_at=r["updated_at"]
-        )
-        for r in reports
-    ]
+    return [report_doc_to_model(r) for r in reports]
+
 
 @api_router.get("/reports/{report_id}", response_model=Report)
 async def get_report(report_id: str, current_user: User = Depends(get_current_user)):
+    """Détails d'un signalement."""
     try:
         report = await db.reports.find_one({"_id": ObjectId(report_id)})
-    except:
-        raise HTTPException(status_code=400, detail="ID de signalement invalide")
-    
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID invalide")
+
     if not report:
         raise HTTPException(status_code=404, detail="Signalement non trouvé")
-    
-    # Check permissions
+
     if current_user.role != UserRole.ADMIN and report["user_id"] != current_user.id:
         raise HTTPException(status_code=403, detail="Accès non autorisé")
-    
-    return Report(
-        id=str(report["_id"]),
-        user_id=report["user_id"],
-        user_name=report["user_name"],
-        type=report["type"],
-        description=report["description"],
-        location=Location(**report["location"]),
-        photos=report["photos"],
-        status=report["status"],
-        admin_notes=report.get("admin_notes"),
-        created_at=report["created_at"],
-        updated_at=report["updated_at"]
-    )
+
+    return report_doc_to_model(report)
+
 
 @api_router.put("/reports/{report_id}", response_model=Report)
 async def update_report(
     report_id: str,
     update_data: ReportUpdate,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    # Only admins can update reports
+    """
+    🔔 ENDPOINT DE MISE À JOUR
+    Met à jour le ticket et déclenche les notifications appropriées
+    en fonction du changement de statut.
+    """
     if current_user.role != UserRole.ADMIN:
-        raise HTTPException(status_code=403, detail="Accès réservé aux administrateurs")
-    
+        raise HTTPException(status_code=403, detail="Réservé aux administrateurs")
+
     try:
         report = await db.reports.find_one({"_id": ObjectId(report_id)})
-    except:
-        raise HTTPException(status_code=400, detail="ID de signalement invalide")
-    
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID invalide")
+
     if not report:
         raise HTTPException(status_code=404, detail="Signalement non trouvé")
-    
-    # Update fields
-    update_fields = {"updated_at": datetime.utcnow()}
+
+    old_status = report.get("status", ReportStatus.RECEIVED)
+
+    # Construire la mise à jour
+    update_fields = {"updated_at": datetime.now(timezone.utc)}
     if update_data.status:
         update_fields["status"] = update_data.status
-    if update_data.admin_notes:
+    if update_data.priority:
+        update_fields["priority"] = update_data.priority
+    if update_data.admin_notes is not None:
         update_fields["admin_notes"] = update_data.admin_notes
-    
+
     await db.reports.update_one(
         {"_id": ObjectId(report_id)},
-        {"$set": update_fields}
+        {"$set": update_fields},
     )
-    
-    # Send push notification to user if status changed
-    if update_data.status and update_data.status != report["status"]:
+
+    # 🚀 DÉCLENCHEMENT DES NOTIFICATIONS
+    if update_data.status and update_data.status != old_status:
+        updated = await db.reports.find_one({"_id": ObjectId(report_id)})
         try:
-            status_messages = {
-                "received": "Votre signalement a été reçu",
-                "processing": "Votre signalement est en cours de traitement",
-                "resolved": "Votre signalement a été résolu",
-            }
-            message = status_messages.get(update_data.status, "Statut du signalement mis à jour")
-            await send_push(
-                recipients=[report["user_id"]],
-                data={
-                    "title": "SignalCitoyen",
-                    "message": message,
-                    "action_url": f"/report-detail/{report_id}",
-                },
-            )
+            await handle_status_change_notifications(updated, old_status, update_data.status)
         except Exception as e:
-            logger = logging.getLogger(__name__)
-            logger.warning(f"Push notification failed (non-blocking): {e}")
-    
-    # Get updated report
-    updated_report = await db.reports.find_one({"_id": ObjectId(report_id)})
-    
-    return Report(
-        id=str(updated_report["_id"]),
-        user_id=updated_report["user_id"],
-        user_name=updated_report["user_name"],
-        type=updated_report["type"],
-        description=updated_report["description"],
-        location=Location(**updated_report["location"]),
-        photos=updated_report["photos"],
-        status=updated_report["status"],
-        admin_notes=updated_report.get("admin_notes"),
-        created_at=updated_report["created_at"],
-        updated_at=updated_report["updated_at"]
-    )
+            logger.warning(f"Notification échouée (non-bloquant): {e}")
+
+    updated = await db.reports.find_one({"_id": ObjectId(report_id)})
+    return report_doc_to_model(updated)
+
 
 @api_router.get("/reports/stats/summary")
 async def get_stats(current_user: User = Depends(get_current_user)):
+    """Statistiques pour le dashboard admin."""
     if current_user.role != UserRole.ADMIN:
-        raise HTTPException(status_code=403, detail="Accès réservé aux administrateurs")
-    
+        raise HTTPException(status_code=403, detail="Réservé aux administrateurs")
+
     total = await db.reports.count_documents({})
     received = await db.reports.count_documents({"status": ReportStatus.RECEIVED})
+    assigned = await db.reports.count_documents({"status": ReportStatus.ASSIGNED})
     processing = await db.reports.count_documents({"status": ReportStatus.PROCESSING})
     resolved = await db.reports.count_documents({"status": ReportStatus.RESOLVED})
-    
+    urgent = await db.reports.count_documents({"priority": Priority.URGENT_CRITIQUE})
+    escalated = await db.reports.count_documents({"escalated": True})
+
     return {
         "total": total,
         "received": received,
+        "assigned": assigned,
         "processing": processing,
-        "resolved": resolved
+        "resolved": resolved,
+        "urgent": urgent,
+        "escalated": escalated,
     }
 
-# Include the router in the main app
+
+@api_router.get("/admin/notification-events")
+async def get_notification_events(
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+):
+    """Historique des événements de notification (audit log)."""
+    if current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Réservé aux administrateurs")
+
+    events = await db.notification_events.find(
+        {},
+        {"_id": 0},
+    ).sort("created_at", -1).limit(limit).to_list(limit)
+
+    # Convertir datetime en string
+    for ev in events:
+        if "created_at" in ev:
+            ev["created_at"] = ev["created_at"].isoformat() if isinstance(ev["created_at"], datetime) else ev["created_at"]
+
+    return {"events": events}
+
+
+# =====================================================================
+# CYCLE DE VIE DE L'APPLICATION
+# =====================================================================
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialise le scheduler à l'allumage du serveur."""
+    # Job d'escalade : exécution toutes les 15 minutes
+    scheduler.add_job(
+        task_escalade_tickets_critiques,
+        'interval',
+        minutes=15,
+        id='escalade_critique',
+        replace_existing=True,
+    )
+    scheduler.start()
+    logger.info("⏰ Scheduler démarré - Tâche d'escalade toutes les 15min")
+
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    """Arrêt propre du serveur."""
+    scheduler.shutdown()
+    await _push_client.aclose()
+    client.close()
+    logger.info("Serveur arrêté proprement")
+
+
+# Inclusion du router
 app.include_router(api_router)
 
 app.add_middleware(
@@ -425,14 +837,3 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()

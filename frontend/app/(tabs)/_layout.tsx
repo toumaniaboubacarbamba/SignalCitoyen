@@ -1,8 +1,11 @@
 import { Tabs } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import React from 'react';
+import { useAuth } from '@/src/contexts/AuthContext';
 
 export default function TabsLayout() {
+  const { isAdmin } = useAuth();
+
   return (
     <Tabs
       screenOptions={{
@@ -18,7 +21,7 @@ export default function TabsLayout() {
           paddingTop: 8,
         },
         tabBarLabelStyle: {
-          fontSize: 12,
+          fontSize: 11,
           fontWeight: '600',
         },
       }}
@@ -57,6 +60,17 @@ export default function TabsLayout() {
           tabBarIcon: ({ color, size }) => (
             <Ionicons name="time" size={size} color={color} />
           ),
+        }}
+      />
+      <Tabs.Screen
+        name="admin"
+        options={{
+          title: 'Admin',
+          tabBarIcon: ({ color, size }) => (
+            <Ionicons name="grid" size={size} color={color} />
+          ),
+          // Masquer l'onglet pour les non-admins
+          href: isAdmin ? '/admin' : null,
         }}
       />
       <Tabs.Screen

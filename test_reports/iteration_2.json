@@ -1,0 +1,47 @@
+{
+  "summary": "Event-driven backend automation verified. 22/22 pytest cases pass (100%). Validated: (1) AUTO-ROUTAGE via BackgroundTasks - water+Cocody -> EQUIPE_EAU_COCODY, zone=COCODY, priority=urgent_critique, status received->assigned within ~1s; waste+Yopougon -> EQUIPE_DECHETS_YOPOUGON, normal; drainage+Plateau -> EQUIPE_ASSAINISSEMENT_PLATEAU, urgent_critique; unknown address -> *_ZONE_INCONNUE. (2) NOTIFICATIONS audit log: PUT status=resolved logs 'email_citizen_resolved' with channel=EMAIL/simulated=true; auto-routing assignment logs 'sms_agent_assigned' with correct to_team. (3) GET /api/admin/notification-events returns {events:[...]} (admin only; citizen=403). (4) GET /api/reports/stats/summary includes new fields: assigned, urgent, escalated (all ints). (5) Filters status_filter/type_filter/priority_filter on /api/reports work correctly. (6) Regression OK: login (citizen+admin+invalid), citizen sees only own reports, admin sees all, citizen blocked from PUT, admin updates persist, /api/register-push endpoint exists (returns 500 with placeholder key as expected). (7) Scheduler: confirmed task_escalade_tickets_critiques function present, scheduler.add_job at minutes=15 in code, and 'Scheduler démarré - Tâche d''escalade toutes les 15min' line found in backend logs at startup. Mocked: EMERGENT_PUSH_KEY=placeholder -> push HTTP calls return 401 upstream which is caught non-blocking (logged 'Push notification échouée (non-bloquant)'); SMS/Email simulated via logger + notification_events collection.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/register-push", "issue": "Still returns 500 with placeholder EMERGENT_PUSH_KEY (HTTPException raised before graceful fallback). Acceptable per spec; consider catching to return {status:'failed'} so mobile never sees 500. Reference: /app/backend/server.py:585-589"},
+      {"endpoint": "PUT /api/reports/{id}", "issue": "ReportUpdate.admin_notes branch uses 'if update_data.admin_notes is not None' correctly (line 735) — OK. But update_data.status uses 'if update_data.status' so empty string would be ignored (low impact since status values are always non-empty). Reference: /app/backend/server.py:731"},
+      {"endpoint": "internal: extraire_zone_depuis_adresse", "issue": "Returns zone in uppercase but accented variants ('Adjamé','Attécoubé','Port-Bouët') get matched then their .upper().replace fixes only É/È/Ê. Works for current ZONES_CONNUES list, but if other accents (Ç, Ô, etc.) added later, would leak. Reference: /app/backend/server.py:355-369"}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_event_driven.py",
+    "/app/backend/tests/test_backend_api.py",
+    "/app/test_reports/pytest/pytest_event_driven.xml"
+  ],
+  "action_items": [
+    "Optional: make /api/register-push always graceful (catch HTTPException from placeholder key, return {status:'failed'}) so the Expo client never receives a 500.",
+    "Optional: fix passlib bcrypt warning by pinning bcrypt<4 (visible at startup, login still works).",
+    "Optional: add an admin endpoint to manually trigger task_escalade_tickets_critiques (useful for QA without waiting 15min and without DB manipulation).",
+    "Optional: extend ZONES_CONNUES normalization to handle additional French accents generically (unicodedata.normalize)."
+  ],
+  "critical_code_review_comments": [
+    "server.py:382-435 - router_automatiquement is robust: atomic update via $set, derives priority from TYPES_CRITIQUES, fires notifications after update, all wrapped in try/except (background task won't crash app).",
+    "server.py:623-660 - POST /reports correctly publishes the routing event via BackgroundTasks; response returns the pre-routing doc (status=received, team_id=None) which is the correct event-driven contract (consumer polls or receives push).",
+    "server.py:705-752 - PUT /reports correctly captures old_status before update and only notifies if status changed. handle_status_change_notifications is non-blocking.",
+    "server.py:780-799 - /admin/notification-events excludes _id ({\"_id\":0}) so MongoDB ObjectId is not leaked. Datetime serialized to ISO. Good.",
+    "server.py:755-777 - stats endpoint returns all required new fields (assigned, urgent, escalated). count_documents calls are efficient.",
+    "server.py:806-818 - Scheduler properly added with replace_existing=True, started on startup, shut down on shutdown.",
+    "server.py:456 - alerter_superviseur_general computes age_hours assuming naive created_at; .replace(tzinfo=utc) is defensive but if created_at is already tz-aware, replace() loses info silently. Low risk since datetime.now(timezone.utc) is used at creation.",
+    "Pydantic V1 .dict() used at line 639 (location.dict()); fine but Pydantic V2 deprecation - prefer model_dump().",
+    "FastAPI @app.on_event('startup'/'shutdown') is deprecated in favor of lifespan handlers - functional but worth modernizing.",
+    "All endpoints under /api prefix; CORS configured; no ObjectId leakage in responses."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100% (22/22)", "frontend": "not tested (backend-only request)"},
+  "seed_data_creation": "Tests create 4 TEST_-prefixed reports under citizen account (water/Cocody, waste/Yopougon, street/unknown, drainage/Plateau). Not cleaned up - small volume, useful for manual QA.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Run: `pytest /app/backend/tests/test_event_driven.py -v` (22 tests, ~4s). BASE_URL from EXPO_PUBLIC_BACKEND_URL. Tests rely on background task completing within 8s (polling). Notification audit log queried via /api/admin/notification-events. Scheduler verified at code + log level only (cannot wait 15 min). Manual escalade trigger via DB insertion is documented as Optional in the original request and was skipped.",
+  "rca_of_issue": "N/A - all features pass."
+}
