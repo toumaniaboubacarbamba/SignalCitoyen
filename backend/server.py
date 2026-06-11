@@ -335,12 +335,36 @@ async def handle_status_change_notifications(report: dict, old_status: str, new_
         ReportStatus.PROCESSING: "Votre signalement est en cours de traitement",
         ReportStatus.RESOLVED: "Votre signalement a été résolu",
     }
+    message = status_labels.get(new_status, "Statut mis à jour")
+
+    # 📥 Persister la notification dans la boîte de réception du citoyen
+    try:
+        type_labels = {
+            "waste": "Déchets sauvages",
+            "water": "Problème d'eau",
+            "drainage": "Assainissement",
+            "street": "Propreté de rue",
+            "other": "Autre",
+        }
+        await db.user_notifications.insert_one({
+            "user_id": user_id,
+            "report_id": report_id,
+            "title": f"Mise à jour : {type_labels.get(report.get('type'), report.get('type'))}",
+            "message": message,
+            "status": new_status,
+            "read": False,
+            "created_at": datetime.now(timezone.utc),
+        })
+    except Exception as e:
+        logger.warning(f"Échec persistance notification inbox: {e}")
+
+    # Push notification (système natif)
     try:
         await send_push(
             recipients=[user_id],
             data={
                 "title": "SignalCitoyen",
-                "message": status_labels.get(new_status, "Statut mis à jour"),
+                "message": message,
                 "action_url": f"/report-detail/{report_id}",
             },
         )
@@ -803,6 +827,68 @@ async def get_notification_events(
             ev["created_at"] = ev["created_at"].isoformat() if isinstance(ev["created_at"], datetime) else ev["created_at"]
 
     return {"events": events}
+
+
+# =====================================================================
+# ENDPOINTS - NOTIFICATIONS UTILISATEUR (Inbox citoyen)
+# =====================================================================
+
+@api_router.get("/notifications")
+async def get_my_notifications(current_user: User = Depends(get_current_user)):
+    """Liste les notifications du citoyen connecté (les plus récentes en premier)."""
+    notifs = await db.user_notifications.find(
+        {"user_id": current_user.id}
+    ).sort("created_at", -1).limit(100).to_list(100)
+
+    return [
+        {
+            "id": str(n["_id"]),
+            "report_id": n.get("report_id"),
+            "title": n.get("title"),
+            "message": n.get("message"),
+            "status": n.get("status"),
+            "read": n.get("read", False),
+            "created_at": n["created_at"].isoformat() if isinstance(n.get("created_at"), datetime) else n.get("created_at"),
+        }
+        for n in notifs
+    ]
+
+
+@api_router.get("/notifications/unread-count")
+async def get_unread_count(current_user: User = Depends(get_current_user)):
+    """Compte des notifications non lues (pour badge)."""
+    count = await db.user_notifications.count_documents({
+        "user_id": current_user.id,
+        "read": False,
+    })
+    return {"unread": count}
+
+
+@api_router.post("/notifications/{notif_id}/read")
+async def mark_notification_read(notif_id: str, current_user: User = Depends(get_current_user)):
+    """Marque une notification comme lue."""
+    try:
+        result = await db.user_notifications.update_one(
+            {"_id": ObjectId(notif_id), "user_id": current_user.id},
+            {"$set": {"read": True}}
+        )
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID invalide")
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Notification non trouvée")
+
+    return {"status": "ok"}
+
+
+@api_router.post("/notifications/read-all")
+async def mark_all_read(current_user: User = Depends(get_current_user)):
+    """Marque toutes les notifications du citoyen comme lues."""
+    result = await db.user_notifications.update_many(
+        {"user_id": current_user.id, "read": False},
+        {"$set": {"read": True}}
+    )
+    return {"updated": result.modified_count}
 
 
 # =====================================================================
