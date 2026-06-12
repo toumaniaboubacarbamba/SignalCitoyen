@@ -28,6 +28,7 @@ interface User {
   email: string;
   name: string;
   role: string;
+  team_id?: string;
   created_at: string;
 }
 
@@ -39,6 +40,8 @@ interface AuthContextType {
   register: (email: string, password: string, name: string) => Promise<void>;
   logout: () => Promise<void>;
   isAdmin: boolean;
+  isAgent: boolean;
+  isCitizen: boolean;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -144,6 +147,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const isAdmin = user?.role === 'admin';
+  const isAgent = user?.role === 'agent';
+  const isCitizen = user?.role === 'citizen';
 
   return (
     <AuthContext.Provider
@@ -155,6 +160,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         register,
         logout,
         isAdmin,
+        isAgent,
+        isCitizen,
       }}
     >
       {children}

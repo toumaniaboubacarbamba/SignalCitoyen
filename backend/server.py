@@ -83,6 +83,7 @@ class Priority:
 
 class UserRole:
     CITIZEN = "citizen"
+    AGENT = "agent"
     ADMIN = "admin"
 
 # Mapping type d'incident → service technique
@@ -121,6 +122,7 @@ class User(BaseModel):
     email: str
     name: str
     role: str = UserRole.CITIZEN
+    team_id: Optional[str] = None  # Pour les agents : ID de leur équipe
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class UserCreate(BaseModel):
@@ -128,6 +130,7 @@ class UserCreate(BaseModel):
     password: str
     name: str
     role: Optional[str] = UserRole.CITIZEN
+    team_id: Optional[str] = None
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -146,11 +149,14 @@ class Report(BaseModel):
     description: str
     location: Location
     photos: List[str] = []
+    proof_photos: List[str] = []  # Photos de preuve de l'agent à la résolution
     status: str = ReportStatus.RECEIVED
     priority: str = Priority.NORMAL
     team_id: Optional[str] = None
     zone: Optional[str] = None
     admin_notes: Optional[str] = None
+    agent_notes: Optional[str] = None  # Note de l'agent à la résolution
+    resolved_by: Optional[str] = None  # Nom de l'agent qui a résolu
     escalated: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -212,6 +218,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         email=user["email"],
         name=user["name"],
         role=user["role"],
+        team_id=user.get("team_id"),
         created_at=user["created_at"],
     )
 
@@ -556,6 +563,7 @@ async def register(user_data: UserCreate):
         "password": hashed_password,
         "name": user_data.name,
         "role": user_data.role,
+        "team_id": user_data.team_id,
         "created_at": datetime.now(timezone.utc),
     }
 
@@ -568,6 +576,7 @@ async def register(user_data: UserCreate):
         email=user_data.email,
         name=user_data.name,
         role=user_data.role,
+        team_id=user_data.team_id,
     )
     return Token(access_token=access_token, token_type="bearer", user=user)
 
@@ -587,6 +596,7 @@ async def login(user_data: UserLogin):
         email=user["email"],
         name=user["name"],
         role=user["role"],
+        team_id=user.get("team_id"),
         created_at=user["created_at"],
     )
     return Token(access_token=access_token, token_type="bearer", user=user_obj)
@@ -633,11 +643,14 @@ def report_doc_to_model(doc: dict) -> Report:
         description=doc["description"],
         location=Location(**doc["location"]),
         photos=doc.get("photos", []),
+        proof_photos=doc.get("proof_photos", []),
         status=doc.get("status", ReportStatus.RECEIVED),
         priority=doc.get("priority", Priority.NORMAL),
         team_id=doc.get("team_id"),
         zone=doc.get("zone"),
         admin_notes=doc.get("admin_notes"),
+        agent_notes=doc.get("agent_notes"),
+        resolved_by=doc.get("resolved_by"),
         escalated=doc.get("escalated", False),
         created_at=doc["created_at"],
         updated_at=doc["updated_at"],
@@ -830,8 +843,240 @@ async def get_notification_events(
 
 
 # =====================================================================
-# ENDPOINTS - NOTIFICATIONS UTILISATEUR (Inbox citoyen)
+# ENDPOINTS - AGENT (équipe terrain)
 # =====================================================================
+
+@api_router.get("/agent/reports", response_model=List[Report])
+async def get_agent_reports(current_user: User = Depends(get_current_user)):
+    """
+    Liste les tickets assignés à l'équipe de l'agent connecté.
+    L'agent voit uniquement les tickets de son team_id (sauf ceux résolus depuis > 7 jours).
+    """
+    if current_user.role != UserRole.AGENT:
+        raise HTTPException(status_code=403, detail="Réservé aux agents")
+
+    if not current_user.team_id:
+        raise HTTPException(status_code=400, detail="Aucune équipe assignée à cet agent")
+
+    # Tickets de mon équipe, non résolus OU résolus récemment (< 7 jours)
+    seuil_anciens = datetime.now(timezone.utc) - timedelta(days=7)
+    query = {
+        "team_id": current_user.team_id,
+        "$or": [
+            {"status": {"$in": [
+                ReportStatus.RECEIVED,
+                ReportStatus.ASSIGNED,
+                ReportStatus.PROCESSING,
+            ]}},
+            {"status": ReportStatus.RESOLVED, "updated_at": {"$gte": seuil_anciens}},
+        ],
+    }
+
+    reports = await db.reports.find(query).sort("created_at", -1).limit(100).to_list(100)
+    # Stripper les photos lourdes pour la liste
+    for r in reports:
+        photos = r.get("photos", [])
+        r["photos"] = photos[:1] if photos else []
+        # Garder les proof_photos pour pouvoir afficher un badge "résolu avec preuve"
+    return [report_doc_to_model(r) for r in reports]
+
+
+@api_router.post("/reports/{report_id}/start-intervention", response_model=Report)
+async def start_intervention(
+    report_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    🛠️ L'agent démarre son intervention sur le terrain.
+    Transitions autorisées : assigned → processing
+    """
+    if current_user.role != UserRole.AGENT:
+        raise HTTPException(status_code=403, detail="Réservé aux agents")
+
+    try:
+        report = await db.reports.find_one({"_id": ObjectId(report_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID invalide")
+
+    if not report:
+        raise HTTPException(status_code=404, detail="Ticket non trouvé")
+
+    # Vérifier que l'agent appartient à l'équipe assignée
+    if report.get("team_id") != current_user.team_id:
+        raise HTTPException(status_code=403, detail="Ticket non assigné à votre équipe")
+
+    if report.get("status") != ReportStatus.ASSIGNED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Le ticket doit être au statut 'Assigné' (actuellement: {report.get('status')})"
+        )
+
+    old_status = report.get("status")
+    await db.reports.update_one(
+        {"_id": ObjectId(report_id)},
+        {"$set": {
+            "status": ReportStatus.PROCESSING,
+            "updated_at": datetime.now(timezone.utc),
+        }},
+    )
+
+    updated = await db.reports.find_one({"_id": ObjectId(report_id)})
+    logger.info(f"🛠️ INTERVENTION DÉMARRÉE | Ticket {report_id[:8]} par {current_user.name}")
+
+    # Notifier le citoyen
+    try:
+        await handle_status_change_notifications(updated, old_status, ReportStatus.PROCESSING)
+    except Exception as e:
+        logger.warning(f"Notification échouée: {e}")
+
+    return report_doc_to_model(updated)
+
+
+class ResolveBody(BaseModel):
+    proof_photos: List[str] = []
+    agent_notes: Optional[str] = None
+
+
+@api_router.post("/reports/{report_id}/resolve", response_model=Report)
+async def resolve_report(
+    report_id: str,
+    body: ResolveBody,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    ✅ L'agent marque le ticket comme résolu avec photos de preuve.
+    Transitions autorisées : assigned/processing → resolved
+    """
+    if current_user.role != UserRole.AGENT:
+        raise HTTPException(status_code=403, detail="Réservé aux agents")
+
+    try:
+        report = await db.reports.find_one({"_id": ObjectId(report_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID invalide")
+
+    if not report:
+        raise HTTPException(status_code=404, detail="Ticket non trouvé")
+
+    if report.get("team_id") != current_user.team_id:
+        raise HTTPException(status_code=403, detail="Ticket non assigné à votre équipe")
+
+    if report.get("status") not in [ReportStatus.ASSIGNED, ReportStatus.PROCESSING]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Le ticket ne peut être résolu depuis le statut {report.get('status')}"
+        )
+
+    # Au moins 1 photo de preuve OBLIGATOIRE pour clore
+    if not body.proof_photos or len(body.proof_photos) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Au moins une photo de preuve est requise pour clore le ticket"
+        )
+
+    old_status = report.get("status")
+    update_fields = {
+        "status": ReportStatus.RESOLVED,
+        "proof_photos": body.proof_photos,
+        "resolved_by": current_user.name,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    if body.agent_notes:
+        update_fields["agent_notes"] = body.agent_notes.strip()
+
+    await db.reports.update_one(
+        {"_id": ObjectId(report_id)},
+        {"$set": update_fields},
+    )
+
+    updated = await db.reports.find_one({"_id": ObjectId(report_id)})
+    logger.info(
+        f"✅ TICKET RÉSOLU | {report_id[:8]} par {current_user.name} "
+        f"({len(body.proof_photos)} photo(s) de preuve)"
+    )
+
+    # Notifier le citoyen
+    try:
+        await handle_status_change_notifications(updated, old_status, ReportStatus.RESOLVED)
+    except Exception as e:
+        logger.warning(f"Notification échouée: {e}")
+
+    return report_doc_to_model(updated)
+
+
+class ReopenBody(BaseModel):
+    reason: str
+
+
+@api_router.post("/reports/{report_id}/reopen", response_model=Report)
+async def reopen_report(
+    report_id: str,
+    body: ReopenBody,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    🔄 L'admin rouvre un ticket résolu (en cas de litige ou résolution non satisfaisante).
+    Transitions autorisées : resolved → assigned
+    """
+    if current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Réservé aux administrateurs")
+
+    try:
+        report = await db.reports.find_one({"_id": ObjectId(report_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID invalide")
+
+    if not report:
+        raise HTTPException(status_code=404, detail="Ticket non trouvé")
+
+    if report.get("status") != ReportStatus.RESOLVED:
+        raise HTTPException(
+            status_code=400,
+            detail="Seul un ticket résolu peut être rouvert"
+        )
+
+    if not body.reason.strip():
+        raise HTTPException(status_code=400, detail="Une raison est obligatoire pour rouvrir un ticket")
+
+    # Notes d'admin: ajouter la raison de réouverture (préfixé)
+    existing_notes = report.get("admin_notes") or ""
+    timestamp = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M")
+    new_note = f"[{timestamp}] RÉOUVERTURE: {body.reason.strip()}"
+    combined_notes = (existing_notes + "\n\n" + new_note) if existing_notes else new_note
+
+    old_status = report.get("status")
+    await db.reports.update_one(
+        {"_id": ObjectId(report_id)},
+        {"$set": {
+            "status": ReportStatus.ASSIGNED,
+            "admin_notes": combined_notes,
+            "updated_at": datetime.now(timezone.utc),
+        }},
+    )
+
+    updated = await db.reports.find_one({"_id": ObjectId(report_id)})
+    logger.warning(
+        f"🔄 RÉOUVERTURE | Ticket {report_id[:8]} par admin {current_user.name} | Raison: {body.reason.strip()}"
+    )
+
+    # Notifier l'équipe (re-SMS) et le citoyen
+    try:
+        await handle_status_change_notifications(updated, old_status, ReportStatus.ASSIGNED)
+    except Exception as e:
+        logger.warning(f"Notification échouée: {e}")
+
+    return report_doc_to_model(updated)
+
+
+# =====================================================================
+# ENDPOINTS - STATISTIQUES & ADMIN
+# =====================================================================
+
+@api_router.get("/reports/stats/summary")
+async def get_stats(current_user: User = Depends(get_current_user)):
+    """Statistiques pour le dashboard admin."""
+    if current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Réservé aux administrateurs")
 
 @api_router.get("/notifications")
 async def get_my_notifications(current_user: User = Depends(get_current_user)):

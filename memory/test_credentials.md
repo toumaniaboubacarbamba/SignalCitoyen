@@ -10,8 +10,18 @@
 - Password: admin123
 - Role: admin
 
+## Agent Accounts (équipes terrain)
+- Email: agent.cocody@test.com
+- Password: agent123
+- Role: agent
+- Team: EQUIPE_EAU_COCODY
+
+- Email: agent.adjame@test.com
+- Password: agent123
+- Role: agent
+- Team: EQUIPE_ASSAINISSEMENT_ADJAME
+
 ## Notes
-- These credentials should be created via the registration screen or backend seed script
-- Passwords are hashed using bcrypt in the database
-- Admin accounts can view all reports and update statuses
-- Citizen accounts can only view their own reports
+- Citoyens : créent et suivent leurs signalements
+- Agents : voient les tickets assignés à leur équipe (team_id), démarrent intervention, résolvent avec photos preuve
+- Admins : supervisent tout, peuvent rouvrir des tickets résolus

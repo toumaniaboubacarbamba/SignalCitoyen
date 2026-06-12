@@ -22,7 +22,7 @@ function NotifIconWithBadge({ color, size, count }: { color: string; size: numbe
 }
 
 export default function TabsLayout() {
-  const { isAdmin, user } = useAuth();
+  const { isAdmin, isAgent, isCitizen, user } = useAuth();
   const [unreadCount, setUnreadCount] = useState(0);
 
   const fetchUnreadCount = useCallback(async () => {
@@ -87,6 +87,8 @@ export default function TabsLayout() {
           tabBarIcon: ({ color, size }) => (
             <Ionicons name="add-circle" size={size} color={color} />
           ),
+          // Caché pour agents (qui sont des employés, pas des signaleurs)
+          href: isAgent ? null : '/new-report',
         }}
       />
       <Tabs.Screen
@@ -105,6 +107,19 @@ export default function TabsLayout() {
           tabBarIcon: ({ color, size }) => (
             <Ionicons name="time" size={size} color={color} />
           ),
+          // Caché pour agents (ils utilisent l'onglet Interventions)
+          href: isAgent ? null : '/history',
+        }}
+      />
+      <Tabs.Screen
+        name="agent"
+        options={{
+          title: 'Interventions',
+          tabBarIcon: ({ color, size }) => (
+            <Ionicons name="briefcase" size={size} color={color} />
+          ),
+          // Visible uniquement pour les agents
+          href: isAgent ? '/agent' : null,
         }}
       />
       <Tabs.Screen
