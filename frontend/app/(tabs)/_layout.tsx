@@ -87,8 +87,9 @@ export default function TabsLayout() {
           tabBarIcon: ({ color, size }) => (
             <Ionicons name="add-circle" size={size} color={color} />
           ),
-          // Caché pour agents (qui sont des employés, pas des signaleurs)
-          href: isAgent ? null : '/new-report',
+          // Visible uniquement pour les citoyens
+          // Les admins/agents n'ont pas vocation à créer des signalements
+          href: isCitizen ? '/new-report' : null,
         }}
       />
       <Tabs.Screen

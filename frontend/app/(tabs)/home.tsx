@@ -24,7 +24,7 @@ interface Stats {
 }
 
 export default function Home() {
-  const { user, isAdmin } = useAuth();
+  const { user, isAdmin, isAgent, isCitizen } = useAuth();
   const router = useRouter();
   const [stats, setStats] = useState<Stats | null>(null);
   const [loading, setLoading] = useState(true);
@@ -108,38 +108,81 @@ export default function Home() {
 
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Actions rapides</Text>
-          
-          <TouchableOpacity
-            style={styles.actionCard}
-            onPress={() => router.push('/(tabs)/new-report')}
-          >
-            <View style={styles.actionIcon}>
-              <Ionicons name="add-circle" size={32} color="#2563eb" />
-            </View>
-            <View style={styles.actionContent}>
-              <Text style={styles.actionTitle}>Nouveau signalement</Text>
-              <Text style={styles.actionDescription}>
-                Signalez un problème de salubrité
-              </Text>
-            </View>
-            <Ionicons name="chevron-forward" size={24} color="#cbd5e1" />
-          </TouchableOpacity>
 
-          <TouchableOpacity
-            style={styles.actionCard}
-            onPress={() => router.push('/(tabs)/history')}
-          >
-            <View style={styles.actionIcon}>
-              <Ionicons name="time" size={32} color="#10b981" />
-            </View>
-            <View style={styles.actionContent}>
-              <Text style={styles.actionTitle}>Mes signalements</Text>
-              <Text style={styles.actionDescription}>
-                Consultez l'historique de vos signalements
-              </Text>
-            </View>
-            <Ionicons name="chevron-forward" size={24} color="#cbd5e1" />
-          </TouchableOpacity>
+          {isCitizen && (
+            <TouchableOpacity
+              style={styles.actionCard}
+              onPress={() => router.push('/(tabs)/new-report')}
+              testID="quick-action-new-report"
+            >
+              <View style={styles.actionIcon}>
+                <Ionicons name="add-circle" size={32} color="#2563eb" />
+              </View>
+              <View style={styles.actionContent}>
+                <Text style={styles.actionTitle}>Nouveau signalement</Text>
+                <Text style={styles.actionDescription}>
+                  Signalez un problème de salubrité
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={24} color="#cbd5e1" />
+            </TouchableOpacity>
+          )}
+
+          {isCitizen && (
+            <TouchableOpacity
+              style={styles.actionCard}
+              onPress={() => router.push('/(tabs)/history')}
+            >
+              <View style={styles.actionIcon}>
+                <Ionicons name="time" size={32} color="#10b981" />
+              </View>
+              <View style={styles.actionContent}>
+                <Text style={styles.actionTitle}>Mes signalements</Text>
+                <Text style={styles.actionDescription}>
+                  Consultez l'historique de vos signalements
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={24} color="#cbd5e1" />
+            </TouchableOpacity>
+          )}
+
+          {isAgent && (
+            <TouchableOpacity
+              style={styles.actionCard}
+              onPress={() => router.push('/(tabs)/agent')}
+              testID="quick-action-interventions"
+            >
+              <View style={[styles.actionIcon, { backgroundColor: '#ede9fe' }]}>
+                <Ionicons name="briefcase" size={32} color="#7c3aed" />
+              </View>
+              <View style={styles.actionContent}>
+                <Text style={styles.actionTitle}>Mes interventions</Text>
+                <Text style={styles.actionDescription}>
+                  Voir les tickets de votre équipe
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={24} color="#cbd5e1" />
+            </TouchableOpacity>
+          )}
+
+          {isAdmin && (
+            <TouchableOpacity
+              style={styles.actionCard}
+              onPress={() => router.push('/(tabs)/admin')}
+              testID="quick-action-admin"
+            >
+              <View style={styles.actionIcon}>
+                <Ionicons name="grid" size={32} color="#2563eb" />
+              </View>
+              <View style={styles.actionContent}>
+                <Text style={styles.actionTitle}>Tableau de bord admin</Text>
+                <Text style={styles.actionDescription}>
+                  Gérer tous les signalements
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={24} color="#cbd5e1" />
+            </TouchableOpacity>
+          )}
         </View>
 
         <View style={styles.infoSection}>

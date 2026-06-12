@@ -365,6 +365,37 @@ async def handle_status_change_notifications(report: dict, old_status: str, new_
     except Exception as e:
         logger.warning(f"Échec persistance notification inbox: {e}")
 
+    # 📥 Notifier les admins aux étapes clés (audit/supervision)
+    # Les admins sont notifiés uniquement pour :
+    # - Résolution par un agent (à valider/auditer)
+    # - Réouverture (pour traçabilité)
+    # Pas de spam pour les transitions intermédiaires
+    if new_status == ReportStatus.RESOLVED and old_status != ReportStatus.RESOLVED:
+        try:
+            admins = await db.users.find({"role": UserRole.ADMIN}).to_list(50)
+            type_labels_admin = {
+                "waste": "Déchets", "water": "Eau", "drainage": "Assainissement",
+                "street": "Voirie", "other": "Autre",
+            }
+            resolved_by = report.get("resolved_by") or "Un agent"
+            for admin in admins:
+                await db.user_notifications.insert_one({
+                    "user_id": str(admin["_id"]),
+                    "report_id": report_id,
+                    "title": f"✓ Ticket résolu par {resolved_by}",
+                    "message": (
+                        f"{type_labels_admin.get(report.get('type'), report.get('type'))} - "
+                        f"Zone: {report.get('zone', 'N/A')} - "
+                        f"À valider si nécessaire"
+                    ),
+                    "status": new_status,
+                    "read": False,
+                    "created_at": datetime.now(timezone.utc),
+                })
+            logger.info(f"📥 {len(admins)} admin(s) notifié(s) de la résolution du ticket {report_id[:8]}")
+        except Exception as e:
+            logger.warning(f"Échec notification admins (résolution): {e}")
+
     # Push notification (système natif)
     try:
         await send_push(
