@@ -1069,14 +1069,8 @@ async def reopen_report(
 
 
 # =====================================================================
-# ENDPOINTS - STATISTIQUES & ADMIN
+# ENDPOINTS - NOTIFICATIONS UTILISATEUR (Inbox citoyen)
 # =====================================================================
-
-@api_router.get("/reports/stats/summary")
-async def get_stats(current_user: User = Depends(get_current_user)):
-    """Statistiques pour le dashboard admin."""
-    if current_user.role != UserRole.ADMIN:
-        raise HTTPException(status_code=403, detail="Réservé aux administrateurs")
 
 @api_router.get("/notifications")
 async def get_my_notifications(current_user: User = Depends(get_current_user)):
