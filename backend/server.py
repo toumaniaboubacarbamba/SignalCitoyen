@@ -770,7 +770,16 @@ async def get_report(report_id: str, current_user: User = Depends(get_current_us
     if not report:
         raise HTTPException(status_code=404, detail="Signalement non trouvé")
 
-    if current_user.role != UserRole.ADMIN and report["user_id"] != current_user.id:
+    # Permissions:
+    # - Admin: voit tout
+    # - Citoyen: voit ses propres signalements
+    # - Agent: voit les tickets assignés à son équipe (team_id)
+    if current_user.role == UserRole.ADMIN:
+        pass  # autorisé
+    elif current_user.role == UserRole.AGENT:
+        if report.get("team_id") != current_user.team_id:
+            raise HTTPException(status_code=403, detail="Ticket non assigné à votre équipe")
+    elif report["user_id"] != current_user.id:
         raise HTTPException(status_code=403, detail="Accès non autorisé")
 
     return report_doc_to_model(report)
