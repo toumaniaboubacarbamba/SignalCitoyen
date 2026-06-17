@@ -39,13 +39,15 @@ interface Report {
 const STATUS_FILTERS = [
   { id: 'all', label: 'Tous' },
   { id: 'received', label: 'Reçus' },
+  { id: 'assigned', label: 'Assignés' },
   { id: 'processing', label: 'En cours' },
   { id: 'resolved', label: 'Résolus' },
 ];
 
 const STATUS_COLORS: Record<string, string> = {
   received: '#f59e0b',
-  processing: '#6366f1',
+  assigned: '#6366f1',
+  processing: '#0ea5e9',
   resolved: '#10b981',
 };
 
@@ -220,6 +222,10 @@ export default function MapScreen() {
         <View style={styles.legendItem}>
           <View style={[styles.legendDot, { backgroundColor: STATUS_COLORS.received }]} />
           <Text style={styles.legendText}>Reçu</Text>
+        </View>
+        <View style={styles.legendItem}>
+          <View style={[styles.legendDot, { backgroundColor: STATUS_COLORS.assigned }]} />
+          <Text style={styles.legendText}>Assigné</Text>
         </View>
         <View style={styles.legendItem}>
           <View style={[styles.legendDot, { backgroundColor: STATUS_COLORS.processing }]} />

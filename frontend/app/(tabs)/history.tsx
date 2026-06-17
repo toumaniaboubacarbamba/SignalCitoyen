@@ -35,7 +35,8 @@ interface Report {
 
 const STATUS_CONFIG: Record<string, { label: string; color: string; bgColor: string }> = {
   received: { label: 'Reçu', color: '#f59e0b', bgColor: '#fef3c7' },
-  processing: { label: 'En traitement', color: '#6366f1', bgColor: '#e0e7ff' },
+  assigned: { label: 'Assigné', color: '#6366f1', bgColor: '#e0e7ff' },
+  processing: { label: 'En traitement', color: '#0ea5e9', bgColor: '#e0f2fe' },
   resolved: { label: 'Résolu', color: '#10b981', bgColor: '#d1fae5' },
 };
 
@@ -50,6 +51,7 @@ const TYPE_LABELS: Record<string, string> = {
 const STATUS_FILTERS = [
   { id: 'all', label: 'Tous', icon: 'apps' },
   { id: 'received', label: 'Reçus', icon: 'mail' },
+  { id: 'assigned', label: 'Assignés', icon: 'people' },
   { id: 'processing', label: 'En cours', icon: 'hourglass' },
   { id: 'resolved', label: 'Résolus', icon: 'checkmark-circle' },
 ];

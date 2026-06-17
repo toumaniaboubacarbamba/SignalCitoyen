@@ -738,9 +738,17 @@ async def get_reports(
     """
     Liste les signalements.
     - Citoyen : voit uniquement les siens
+    - Agent : voit les tickets assignés à son équipe
     - Admin : voit tous les tickets, avec filtres
     """
-    query = {} if current_user.role == UserRole.ADMIN else {"user_id": current_user.id}
+    if current_user.role == UserRole.ADMIN:
+        query = {}
+    elif current_user.role == UserRole.AGENT:
+        if not current_user.team_id:
+            return []
+        query = {"team_id": current_user.team_id}
+    else:
+        query = {"user_id": current_user.id}
 
     if status_filter:
         query["status"] = status_filter
