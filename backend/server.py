@@ -19,8 +19,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import os
 import logging
 import httpx
+import asyncio
+from functools import partial
 from pathlib import Path
 from bson import ObjectId
+from twilio.rest import Client as TwilioClient
 
 # =====================================================================
 # CONFIGURATION
@@ -47,6 +50,15 @@ _push_client = httpx.AsyncClient(
     headers={"X-Push-Key": PUSH_KEY},
     timeout=10.0,
 )
+
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
+
+def _get_twilio():
+    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and not TWILIO_ACCOUNT_SID.startswith("VOTRE"):
+        return TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    return None
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
@@ -99,7 +111,7 @@ TYPE_TO_SERVICE = {
 ZONES_CONNUES = [
     "Cocody", "Yopougon", "Plateau", "Adjamé", "Adjame",
     "Marcory", "Treichville", "Abobo", "Attécoubé", "Attecoube",
-    "Port-Bouët", "Port-Bouet", "Koumassi", "Bingerville", "Anyama",
+    "Port-Bouët", "Port-Bouet", "Koumassi", "Bingerville", "Anyama","Bassam", "Songon", "Grand Bassam", "Jacqueville",
 ]
 
 # Types critiques nécessitant une escalade rapide
@@ -122,7 +134,8 @@ class User(BaseModel):
     email: str
     name: str
     role: str = UserRole.CITIZEN
-    team_id: Optional[str] = None  # Pour les agents : ID de leur équipe
+    team_id: Optional[str] = None
+    phone: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class UserCreate(BaseModel):
@@ -131,6 +144,7 @@ class UserCreate(BaseModel):
     name: str
     role: Optional[str] = UserRole.CITIZEN
     team_id: Optional[str] = None
+    phone: Optional[str] = None
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -219,6 +233,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         name=user["name"],
         role=user["role"],
         team_id=user.get("team_id"),
+        phone=user.get("phone"),
         created_at=user["created_at"],
     )
 
@@ -263,6 +278,57 @@ async def log_notification_event(event_type: str, payload: dict) -> None:
         })
     except Exception as e:
         logger.warning(f"Échec persistance notification: {e}")
+
+
+def normalize_ci_phone(phone: Optional[str]) -> Optional[str]:
+    """Normalise un numéro ivoirien pour le stocker en local 8 chiffres.
+
+    Exemple Twilio : +22509665752 -> 09665752
+    Exemple utilisateur : 72796112 -> 72796112
+    """
+    if not phone:
+        return None
+    phone = phone.strip().replace(" ", "").replace("-", "")
+    if phone.startswith("whatsapp:"):
+        phone = phone.split(":", 1)[1]
+    if phone.startswith("+225"):
+        return phone[4:]
+    if phone.startswith("225") and len(phone) >= 11:
+        return phone[3:]
+    if phone.startswith("+"):
+        return phone[1:]
+    return phone
+
+
+def _to_e164_ci(phone: str) -> str:
+    """Convertit un numéro ivoirien local en format E.164 (+225XXXXXXXXXX)."""
+    phone = phone.strip().replace(" ", "").replace("-", "")
+    if phone.startswith("+"):
+        return phone
+    return f"+225{phone}"
+
+
+async def send_whatsapp(to_phone: str, message: str) -> None:
+    """Envoie un message WhatsApp via Twilio (sandbox ou prod)."""
+    twilio = _get_twilio()
+    if not twilio:
+        logger.warning("Twilio non configuré — WhatsApp non envoyé")
+        return
+    try:
+        phone_e164 = _to_e164_ci(to_phone)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            partial(
+                twilio.messages.create,
+                from_=TWILIO_WHATSAPP_FROM,
+                to=f"whatsapp:{phone_e164}",
+                body=message,
+            ),
+        )
+        logger.info(f"📱 [WHATSAPP] → {phone_e164} | {message[:60]}…")
+    except Exception as e:
+        logger.warning(f"Échec WhatsApp vers {to_phone}: {e}")
 
 
 async def simulate_sms_to_agent(team_id: str, report_id: str, message: str) -> None:
@@ -315,7 +381,7 @@ async def handle_status_change_notifications(report: dict, old_status: str, new_
     team_id = report.get("team_id")
     user_id = report.get("user_id")
 
-    # Transition vers "Assigné" → SMS à l'équipe terrain
+    # Transition vers "Assigné" → SMS à l'équipe terrain + notif inbox agents
     if new_status == ReportStatus.ASSIGNED and old_status != ReportStatus.ASSIGNED:
         message = (
             f"Nouveau ticket {report_id[:8]} - "
@@ -324,6 +390,33 @@ async def handle_status_change_notifications(report: dict, old_status: str, new_
         )
         if team_id:
             await simulate_sms_to_agent(team_id, report_id, message)
+            try:
+                type_labels_agent = {
+                    "waste": "Déchets sauvages", "water": "Problème d'eau",
+                    "drainage": "Assainissement", "street": "Propreté de rue", "other": "Autre",
+                }
+                agents = await db.users.find({"role": UserRole.AGENT, "team_id": team_id}).to_list(20)
+                for agent in agents:
+                    await db.user_notifications.insert_one({
+                        "user_id": str(agent["_id"]),
+                        "report_id": report_id,
+                        "title": f"Nouveau ticket : {type_labels_agent.get(report.get('type'), report.get('type'))}",
+                        "message": f"Ticket assigné à votre équipe - Zone: {report.get('zone', 'N/A')}",
+                        "status": new_status,
+                        "read": False,
+                        "created_at": datetime.now(timezone.utc),
+                    })
+                    if agent.get("phone"):
+                        wa_msg = (
+                            f"🔔 *SignalCitoyen* — Nouveau ticket #{report_id[:8]}\n"
+                            f"Type : {type_labels_agent.get(report.get('type'), report.get('type'))}\n"
+                            f"Zone : {report.get('zone', 'N/A')}\n"
+                            f"Connectez-vous pour voir les détails."
+                        )
+                        await send_whatsapp(agent["phone"], wa_msg)
+                logger.info(f"📥 {len(agents)} agent(s) notifié(s) pour le ticket {report_id[:8]}")
+            except Exception as e:
+                logger.warning(f"Échec notification agents (assignation): {e}")
 
     # Transition vers "Résolu" → Email au citoyen + Push
     if new_status == ReportStatus.RESOLVED and old_status != ReportStatus.RESOLVED:
@@ -364,6 +457,30 @@ async def handle_status_change_notifications(report: dict, old_status: str, new_
         })
     except Exception as e:
         logger.warning(f"Échec persistance notification inbox: {e}")
+
+    # 📱 WhatsApp au citoyen pour tout changement de statut
+    try:
+        citoyen = await db.users.find_one({"_id": ObjectId(user_id)})
+        if citoyen and citoyen.get("phone"):
+            wa_status_labels = {
+                ReportStatus.ASSIGNED: "✅ assigné à une équipe technique",
+                ReportStatus.PROCESSING: "🔧 en cours de traitement",
+                ReportStatus.RESOLVED: "✅ résolu !",
+            }
+            if new_status in wa_status_labels:
+                type_labels_wa = {
+                    "waste": "Déchets sauvages", "water": "Problème d'eau",
+                    "drainage": "Assainissement", "street": "Propreté de rue", "other": "Autre",
+                }
+                wa_msg = (
+                    f"📍 *SignalCitoyen* — Mise à jour\n"
+                    f"Votre signalement *{type_labels_wa.get(report.get('type'), report.get('type'))}* "
+                    f"est {wa_status_labels[new_status]}\n"
+                    f"Référence : #{report_id[:8]}"
+                )
+                await send_whatsapp(citoyen["phone"], wa_msg)
+    except Exception as e:
+        logger.warning(f"Échec WhatsApp citoyen: {e}")
 
     # 📥 Notifier les admins aux étapes clés (audit/supervision)
     # Les admins sont notifiés uniquement pour :
@@ -589,12 +706,14 @@ async def register(user_data: UserCreate):
         raise HTTPException(status_code=400, detail="Email déjà enregistré")
 
     hashed_password = get_password_hash(user_data.password)
+    normalized_phone = normalize_ci_phone(user_data.phone)
     user_doc = {
         "email": user_data.email,
         "password": hashed_password,
         "name": user_data.name,
         "role": user_data.role,
         "team_id": user_data.team_id,
+        "phone": normalized_phone,
         "created_at": datetime.now(timezone.utc),
     }
 
@@ -608,6 +727,7 @@ async def register(user_data: UserCreate):
         name=user_data.name,
         role=user_data.role,
         team_id=user_data.team_id,
+        phone=normalized_phone,
     )
     return Token(access_token=access_token, token_type="bearer", user=user)
 
@@ -628,6 +748,7 @@ async def login(user_data: UserLogin):
         name=user["name"],
         role=user["role"],
         team_id=user.get("team_id"),
+        phone=user.get("phone"),
         created_at=user["created_at"],
     )
     return Token(access_token=access_token, token_type="bearer", user=user_obj)
@@ -1182,9 +1303,120 @@ async def mark_all_read(current_user: User = Depends(get_current_user)):
 # CYCLE DE VIE DE L'APPLICATION
 # =====================================================================
 
+async def seed_test_users():
+    """Crée les comptes de test au démarrage si inexistants."""
+    test_users = [
+        {
+            "email": "admin@signalcitoyen.ci",
+            "name": "Administrateur",
+            "password": "Admin2026!",
+            "role": UserRole.ADMIN,
+            "team_id": None,
+            "phone": None,
+        },
+        {
+            "email": "citoyen@signalcitoyen.ci",
+            "name": "Jean Dupont",
+            "password": "Citoyen2026!",
+            "role": UserRole.CITIZEN,
+            "team_id": None,
+            "phone": "+22509665752",
+        },
+        {
+            "email": "agent.adjame@signalcitoyen.ci",
+            "name": "Agent Adjamé",
+            "password": "Agent2026!",
+            "role": UserRole.AGENT,
+            "team_id": "EQUIPE_EAU_ADJAME",
+            "phone": "+22501234567",
+        },
+        {
+            "email": "agent.yopougon@signalcitoyen.ci",
+            "name": "Agent Yopougon",
+            "password": "Agent2026!",
+            "role": UserRole.AGENT,
+            "team_id": "EQUIPE_EAU_YOPOUGON",
+            "phone": "+22502234567",
+        },
+        {
+            "email": "agent.bassam@signalcitoyen.ci",
+            "name": "Agent Bassam",
+            "password": "Agent2026!",
+            "role": UserRole.AGENT,
+            "team_id": "EQUIPE_EAU_BASSAM",
+            "phone": "+2257172796112",
+        },
+        {
+            "email": "agent.cocody@signalcitoyen.ci",
+            "name": "Agent Cocody",
+            "password": "Agent2026!",
+            "role": UserRole.AGENT,
+            "team_id": "EQUIPE_EAU_COCODY",
+            "phone": "+22504234567",
+        },
+        {
+            "email": "agent.dechets.adjame@signalcitoyen.ci",
+            "name": "Agent Déchets Adjamé",
+            "password": "Agent2026!",
+            "role": UserRole.AGENT,
+            "team_id": "EQUIPE_DECHETS_ADJAME",
+            "phone": "+22507234567",
+        },
+        {
+            "email": "agent.dechets.yopougon@signalcitoyen.ci",
+            "name": "Agent Déchets Yopougon",
+            "password": "Agent2026!",
+            "role": UserRole.AGENT,
+            "team_id": "EQUIPE_DECHETS_YOPOUGON",
+            "phone": "+22508234567",
+        },
+        {
+            "email": "agent.dechets.bassam@signalcitoyen.ci",
+            "name": "Agent Déchets Bassam",
+            "password": "Agent2026!",
+            "role": UserRole.AGENT,
+            "team_id": "EQUIPE_DECHETS_BASSAM",
+            "phone": "+22509234567",
+        },
+        {
+            "email": "agent.dechets.cocody@signalcitoyen.ci",
+            "name": "Agent Déchets Cocody",
+            "password": "Agent2026!",
+            "role": UserRole.AGENT,
+            "team_id": "EQUIPE_DECHETS_COCODY",
+            "phone": "+22505234567",
+        },
+    ]
+
+    for user_data in test_users:
+        existing = await db.users.find_one({"email": user_data["email"]})
+        if not existing:
+            hashed_password = get_password_hash(user_data["password"])
+            normalized_phone = normalize_ci_phone(user_data["phone"])
+            user_doc = {
+                "email": user_data["email"],
+                "password": hashed_password,
+                "name": user_data["name"],
+                "role": user_data["role"],
+                "team_id": user_data["team_id"],
+                "phone": normalized_phone,
+                "created_at": datetime.now(timezone.utc),
+            }
+            try:
+                result = await db.users.insert_one(user_doc)
+                logger.info(f"✅ Compte créé : {user_data['email']} ({user_data['role']})")
+            except Exception as e:
+                logger.warning(f"⚠️  Impossible de créer {user_data['email']}: {e}")
+        else:
+            logger.info(f"ℹ️  Compte existant : {user_data['email']}")
+
+
 @app.on_event("startup")
 async def startup_event():
-    """Initialise le scheduler à l'allumage du serveur."""
+    """Initialise le scheduler et crée les comptes de test au démarrage du serveur."""
+    # Créer les comptes de test
+    await seed_test_users()
+    
     # Job d'escalade : exécution toutes les 15 minutes
     scheduler.add_job(
         task_escalade_tickets_critiques,
